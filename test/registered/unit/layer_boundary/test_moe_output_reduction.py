@@ -167,16 +167,23 @@ class TestReplicatedMoeOutput(CustomTestCase):
 class TestModelsWithExplicitDpCompletion(CustomTestCase):
     def test_direct_dp_exits_publish_their_selected_sum(self):
         # Execute the real orchestration methods without constructing weights.
-        # DeepSeek V4 owns its DP exit instead of using a stage boundary.
+        # Execute the boundary-owned operand transport without constructing weights.
         import __future__
 
-        filename, method = "deepseek_v4.py", "_run_moe_ffn_dp_sync"
+        filename, method = "deepseek_v4_boundary.py", "MoeTransport"
         path = MODELS_DIR / filename
         node = next(
             n
             for n in ast.walk(ast.parse(path.read_text()))
-            if isinstance(n, ast.FunctionDef) and n.name == method
+            if isinstance(n, ast.ClassDef) and n.name == method
         )
+
+        class StripImports(ast.NodeTransformer):
+            def visit_ImportFrom(self, node):
+                return None
+
+        node = StripImports().visit(node)
+        ast.fix_missing_locations(node)
         for use_rsv in (False, True):
             with self.subTest(model=filename, reduce_scatterv=use_rsv):
                 trace = []
@@ -195,6 +202,16 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                 )
                 namespace = dict(
                     torch=torch,
+                    ExitStack=contextlib.ExitStack,
+                    contextmanager=contextlib.contextmanager,
+                    ComputeTransport=object,
+                    residual_batch=types.SimpleNamespace(
+                        written_residual=lambda b: types.SimpleNamespace(fusion=None)
+                    ),
+                    can_fuse_all_reduce=lambda *a: False,
+                    MoeFinalize=object,
+                    MoEOutput=type("MoEOutput", (), {}),
+                    post_experts_all_reduce=reduce_moe_output,
                     get_forward=get_forward,
                     get_parallel=lambda: parallel,
                     get_moe_a2a_backend=lambda: a2a(),
@@ -225,12 +242,13 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                 )
                 model = types.SimpleNamespace(
                     dsa_enable_prefill_cp=False,
-                    mlp=lambda value, batch, **kwargs: reduce_moe_output(value),
+                    boundary_mhc_fusions=False,
+                    mlp=lambda value, batch, **kwargs: value,
                 )
                 batch = types.SimpleNamespace(
                     dp_padding_mode=types.SimpleNamespace(is_max_len=lambda: True)
                 )
-                kwargs = dict(input_ids=None, input_ids_global=None)
+                call = types.SimpleNamespace(input_ids=None, input_ids_global=None)
                 with (
                     moe_config(),
                     get_forward().scoped(mlp_reduce_scatter=False),
@@ -239,7 +257,10 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                         side_effect=lambda value: trace.append("AR") or value * 2,
                     ),
                 ):
-                    output = namespace[method](model, torch.ones(2, 3), batch, **kwargs)
+                    transport = namespace[method](model, torch.ones(2, 3), batch, call)
+                    with transport.scope():
+                        value = model.mlp(transport.input, batch)
+                    output = transport.finish(value)
                     self.assertFalse(get_forward().mlp_reduce_scatter)
                 self.assertEqual(trace, ["RSv"] if use_rsv else ["AR", "slice"])
                 torch.testing.assert_close(output, torch.full((2, 3), 2.0))

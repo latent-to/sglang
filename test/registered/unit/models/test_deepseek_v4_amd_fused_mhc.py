@@ -196,14 +196,14 @@ class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
     layer's deferred post was never applied and every subsequent layer computed
     on corrupted activations.
 
-    Drives the real ``DeepseekV4DecoderLayer.forward`` on a mocked layer with the
+    Drives the decoder's real consumer read on a mocked layer with the
     fused dispatcher forced to ``None`` and halts at ``self_attn`` via a sentinel,
     so only the boundary fallback executes.
     """
 
     def test_fallback_closes_previous_post_before_pre(self):
         try:
-            from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+            pass
         except Exception as e:  # pragma: no cover - env without full model deps
             self.skipTest(f"deepseek_v4 import unavailable: {e}")
 
@@ -212,6 +212,9 @@ class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
 
         layer = mock.Mock()
         layer.use_fused_mhc_post_pre = True
+        layer.boundary_pre_from_prev = False
+        layer.boundary_mhc_fusions = True
+        layer.hc_boundary_fused = False
         layer._input_layernorm_weight_bf16 = None
         closed_post = object()
         layer.hc_post.return_value = closed_post
@@ -224,21 +227,21 @@ class TestAmdFusedMhcAttnBoundaryFallback(unittest.TestCase):
 
         with (
             mock.patch(
-                "sglang.srt.models.deepseek_v4.apply_mhc_post_pre_boundary",
+                "sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc.apply_mhc_post_pre_boundary",
                 return_value=None,
             ),
-            self.assertRaises(_StopForward),
         ):
-            DeepseekV4DecoderLayer.forward(
-                layer,
-                positions=object(),
-                hidden_states=hs_in,
-                input_ids=object(),
-                forward_batch=object(),
-                input_ids_global=object(),
-                prev_residual=prev_residual,
-                prev_post=prev_post,
-                prev_comb=prev_comb,
+            from sglang.srt.models.deepseek_v4_boundary import (
+                HcRead,
+                HcUpdate,
+                ReadState,
+            )
+
+            HcRead(layer, True).bind(object(), object()).update_and_read(
+                HcUpdate(layer, False),
+                hs_in,
+                ReadState(prev_residual, prev_post, prev_comb),
+                layer.input_layernorm,
             )
 
         # The deferred previous-layer post must be closed with exactly the
@@ -263,7 +266,7 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
     silently corrupting every subsequent layer. The fix mirrors the unfused
     ``hc_pre`` branch: apply the input layernorm when ``norm_fused`` is False.
 
-    Drives the real ``DeepseekV4DecoderLayer.forward`` with the boundary forced to
+    Drives the decoder's real consumer read with the boundary forced to
     return ``norm_fused=False`` and halts at ``self_attn`` via a sentinel.
     """
 
@@ -279,6 +282,9 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
 
         layer = mock.Mock()
         layer.use_fused_mhc_post_pre = True
+        layer.boundary_pre_from_prev = False
+        layer.boundary_mhc_fusions = True
+        layer.hc_boundary_fused = False
         layer._input_layernorm_weight_bf16 = None
 
         fused_hs = object()
@@ -299,21 +305,21 @@ class TestAmdFusedMhcNormFusedHandling(unittest.TestCase):
             mock.patch.object(deepseek_v4, "_use_aiter", False),
             mock.patch.object(deepseek_v4, "_is_gfx95_supported", False),
             mock.patch(
-                "sglang.srt.models.deepseek_v4.apply_mhc_post_pre_boundary",
+                "sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc.apply_mhc_post_pre_boundary",
                 return_value=(residual, fused_hs, post, comb, False),
             ),
-            self.assertRaises(_StopForward),
         ):
-            DeepseekV4DecoderLayer.forward(
-                layer,
-                positions=object(),
-                hidden_states=object(),
-                input_ids=object(),
-                forward_batch=object(),
-                input_ids_global=object(),
-                prev_residual=object(),
-                prev_post=object(),
-                prev_comb=object(),
+            from sglang.srt.models.deepseek_v4_boundary import (
+                HcRead,
+                HcUpdate,
+                ReadState,
+            )
+
+            HcRead(layer, True).bind(object(), object()).update_and_read(
+                HcUpdate(layer, False),
+                object(),
+                ReadState(object(), object(), object()),
+                layer.input_layernorm,
             )
 
         # The fused (unnormalized) layer input must be run through the input

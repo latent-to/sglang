@@ -982,10 +982,13 @@ class DeepseekV2MoE(nn.Module):
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
         return_moe_output: bool = False,
+        leave_output_sum: bool = False,
     ) -> Union[torch.Tensor, MoEOutput]:
         """``return_moe_output`` asks for the pieces unmerged, as `MoEOutput`; only
         the TP paths honor it. Distinct from `get_forward().defer_moe_finalize`,
-        the V2/V3 layer-boundary handoff."""
+        the V2/V3 layer-boundary handoff. ``leave_output_sum`` returns those
+        pieces while preserving the existing finalize kernel selection, for
+        a boundary that owns reduction and the replicated shared add."""
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
@@ -1005,7 +1008,7 @@ class DeepseekV2MoE(nn.Module):
         if use_vision_topk and _is_hip:
             use_vision_topk = _hip_moe.batch_has_images(forward_batch)
         if not self._enable_a2a_moe:
-            if self._can_dual_stream_graph(hidden_states):
+            if not leave_output_sum and self._can_dual_stream_graph(hidden_states):
                 fwd = get_forward()
                 return dsv2_flashinfer_moe_dual_stream_graph(
                     hidden_states,
@@ -1027,6 +1030,7 @@ class DeepseekV2MoE(nn.Module):
                     num_token_non_padded=num_token_non_padded,
                     use_vision_topk=use_vision_topk,
                     return_moe_output=return_moe_output,
+                    leave_output_sum=leave_output_sum,
                 )
             else:
                 return self.forward_normal(
@@ -1038,6 +1042,7 @@ class DeepseekV2MoE(nn.Module):
                     num_token_non_padded=num_token_non_padded,
                     use_vision_topk=use_vision_topk,
                     return_moe_output=return_moe_output,
+                    leave_output_sum=leave_output_sum,
                 )
         else:
             return self.forward_deepep(
@@ -1053,6 +1058,7 @@ class DeepseekV2MoE(nn.Module):
         num_token_non_padded: Optional[torch.Tensor] = None,
         use_vision_topk: bool = False,
         return_moe_output: bool = False,
+        leave_output_sum: bool = False,
     ) -> Union[torch.Tensor, MoEOutput]:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
@@ -1195,7 +1201,7 @@ class DeepseekV2MoE(nn.Module):
                 reduce=sum_post_experts_output,
             )
 
-        if return_moe_output:
+        if return_moe_output or leave_output_sum:
             return MoEOutput(
                 routed=final_hidden_states,
                 shared=shared_output,
@@ -1238,6 +1244,7 @@ class DeepseekV2MoE(nn.Module):
         num_token_non_padded: Optional[torch.Tensor] = None,
         use_vision_topk: bool = False,
         return_moe_output: bool = False,
+        leave_output_sum: bool = False,
     ) -> Union[torch.Tensor, MoEOutput]:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1373,7 +1380,7 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
-        if return_moe_output:
+        if return_moe_output or leave_output_sum:
             return MoEOutput(
                 routed=final_hidden_states,
                 shared=shared_output,
