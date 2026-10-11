@@ -1125,6 +1125,9 @@ class DeepseekV2MoE(nn.Module):
                     expert_location_dispatch_info=dispatch_info,
                     **topk_kwargs,
                 )
+        from sglang.srt.models.deepseek_v4_prune import prune_topk
+
+        topk_output = prune_topk(self, topk_output)
         # Issued after the router so the main chain stays on the main stream at replay.
         routed_pre_quant_input = pre_quant_input
         if should_quant_routed_input_mxfp8:
@@ -1134,11 +1137,15 @@ class DeepseekV2MoE(nn.Module):
                 )
                 ready = self.routed_quant_stream.record_event()
             routed_pre_quant_input = Mxfp8RoutedInputPreQuant(x_q, x_sf, ready)
+        supports_deferred_finalize = (
+            self.experts.supports_deferred_finalize
+            if topk_output.format == TopKOutputFormat.BYPASSED
+            else self.experts.supports_routed_deferred_finalize
+        )
         deferred_finalize = (
             has_shared_output
             and not self._shared_expert_tp1
-            and topk_output.format == TopKOutputFormat.BYPASSED
-            and self.experts.supports_deferred_finalize
+            and supports_deferred_finalize
             and (
                 self._deferred_finalize_max_tokens <= 0
                 or hidden_states.shape[0] <= self._deferred_finalize_max_tokens
@@ -1311,6 +1318,9 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states.device, layer_id=self.layer_id
             )
 
+        from sglang.srt.models.deepseek_v4_prune import prune_topk
+
+        topk_output = prune_topk(self, topk_output)
         if self._fuse_shared_experts_inside_sbo and not skip_shared_experts:
             shared_output = None
 

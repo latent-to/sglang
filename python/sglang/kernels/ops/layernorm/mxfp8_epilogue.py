@@ -88,7 +88,8 @@ def rmsnorm_mxfp8(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """RMSNorm returning ``(y_bf16, y_q, y_sf)`` with the same MXFP8 epilogue."""
     m, k = x.shape
-    assert 0 < m <= 8 and k % 32 == 0
+    # One swizzled scale tile covers 128 rows; the model dispatch uses <=64.
+    assert 0 < m <= 128 and k % 32 == 0
     assert x.dtype == weight.dtype == torch.bfloat16 and x.stride(1) == 1
     y = torch.empty_like(x, memory_format=torch.contiguous_format)
     q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
