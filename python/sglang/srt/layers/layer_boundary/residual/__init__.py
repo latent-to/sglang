@@ -39,6 +39,11 @@ class ResidualUpdate(Protocol):
             This is a numerical policy, separate from being a plain add; full
             precision is always correct.
 
+    An optional ``bind(forward_batch)`` returns an update owning this call's
+    dynamic metadata. The stage binds it once before recording a contribution;
+    every capability must match the declaration. Consumption releases the
+    invocation update with its contribution.
+
     The shard conversion methods must move any update-associated state together
     with the residual. Nonlinear updates must not claim is_plain_add.
     """
@@ -175,12 +180,51 @@ class ResidualReadout(Protocol):
         """
 
 
+def bind_update(update, forward_batch, context=None):
+    """Bind optional per-invocation producer state before recording output.
+
+    ``bind(batch)`` must preserve every declared update capability and return
+    an update owning its invocation context. Stateless updates are unchanged.
+    """
+    bind_context = getattr(update, "bind_context", None)
+    bind = getattr(update, "bind", None)
+    if bind is None:
+        return update
+    actual = (
+        bind_context(forward_batch, context)
+        if bind_context is not None
+        else bind(forward_batch)
+    )
+    for fact in (
+        "is_plain_add",
+        "applied_at_exit",
+        "outlives_layer",
+        "writes_stream",
+        "quantized_sum",
+    ):
+        if getattr(actual, fact) != getattr(update, fact):
+            raise ValueError("invocation update changed a declared capability")
+    return actual
+
+
+def takes_pending_update(read, update):
+    """Whether a final read explicitly accepts this producer's update."""
+    accepts = getattr(read, "accepts_pending_update", None)
+    return accepts is not None and accepts(update)
+
+
 class FinalRead(Protocol):
     """The model's read of the layer stack's output, its final norm.
 
     Called with the output alone on a stream its producer already wrote, else
     with the output and the residual, returning ``(normed, residual)``: the
     residual add followed by the norm, so a pending update must be a plain add.
+
+    A ResidualReadout can instead explicitly supply
+    ``accepts_pending_update(update)`` and consume the pending producer update
+    through residual_batch.read_output(output, batch, read, norm). Construction
+    checks the declared update; execution checks the actual invocation. This
+    does not change the ordinary two-input final norm contract.
 
     Optional, each read where it is used with the default given:
         attn_tp_gather: Its own gather over attention TP of rows the stack's

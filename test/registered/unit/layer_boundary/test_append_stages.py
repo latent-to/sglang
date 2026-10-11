@@ -1119,6 +1119,8 @@ class TestReadKernels(CustomTestCase):
                 return "boundary", residual
 
         class Update:
+            is_plain_add = True
+
             def slice_residual_attn_tp(self, residual):
                 return residual[:2]
 

@@ -50,6 +50,7 @@ from sglang.srt.layers.layer_boundary.prepare import (
     _attn_input_default,
     _attn_input_scattered,
 )
+from sglang.srt.layers.layer_boundary.residual import takes_pending_update
 from sglang.srt.layers.layer_boundary.stage import StageBoundary
 from sglang.srt.runtime_context import (
     get_forward,
@@ -189,6 +190,8 @@ class StagePlan:
                     edges.outgoing,
                     cp_moves=edges.cp_moves,
                     attn_tp_gather=exit_gather,
+                    local_stage=not writes_at_handoff,
+                    writes_at_handoff=writes_at_handoff,
                 )
             )
             path = StagePath(
@@ -276,7 +279,17 @@ def _bind_stage(
     if incoming.entries.keys() != outgoing.exits.keys():
         raise ValueError("incoming and outgoing batch variants disagree")
     update = declaration.update
-    if declaration.terminal and not (update.is_plain_add or update.applied_at_exit):
+    if declaration.row_transport is not None and declaration.row_transport.bind is None:
+        raise ValueError("a local stage requires its compute transport")
+    if declaration.sum_impl is not None and declaration.sum_impl.run is None:
+        raise ValueError("a local stage requires its custom sum implementation")
+    if declaration.output_complete and declaration.sum_impl is not None:
+        raise ValueError("compute-completed output cannot also declare a custom sum")
+    if declaration.terminal and not (
+        update.is_plain_add
+        or update.applied_at_exit
+        or takes_pending_update(final_read, update)
+    ):
         # The final read adds the last output into the residual itself, as a
         # plain add, before its norm.
         raise NotImplementedError(
@@ -295,7 +308,10 @@ def _bind_stage(
                 "an update applied at the stage's exit with a gather over attention CP"
             )
         attn_input_adapter = None
-        if declaration.kind is StageKind.ATTENTION:
+        if (
+            declaration.kind is StageKind.ATTENTION
+            and declaration.row_transport is None
+        ):
             # On an input-scattered batch the step gathers the rows itself for
             # an attention whose QKV hook does not gather them after the
             # projection.

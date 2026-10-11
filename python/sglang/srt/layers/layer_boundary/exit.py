@@ -49,6 +49,7 @@ from sglang.srt.layers.layer_boundary.ops import (
 from sglang.srt.layers.layer_boundary.output import (
     UnreducedOutput,
 )
+from sglang.srt.layers.layer_boundary.residual import bind_update
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     aiter_ar_fusion_applies,
     flashinfer_ar_fusion_applies,
@@ -116,7 +117,7 @@ def exit_facts(kind, plan, variant, path) -> ExitFacts:
     )
     may_defer_sum = (
         tp
-        and not plan.terminal
+        and (not plan.terminal or output.may_defer_to_next)
         and _sum_deferral_allowed(plan, output, scattered=scattered)
         # Under attention DP the next layer must also run postprocess's
         # scatter back to this rank's tokens, and nothing more.
@@ -221,14 +222,19 @@ class ExitPolicy:
             residual,
             stream,
             steps.output.update,
+            forward_batch=forward_batch,
         )
 
     @staticmethod
-    def _record_output(hidden_states, residual, stream, update, declared_sum=None):
+    def _record_output(
+        hidden_states, residual, stream, update, declared_sum=None, forward_batch=None
+    ):
         stream.residual = residual
         if update.applied_at_exit:
             return stream.write(hidden_states)
-        return stream.record(hidden_states, update, declared_sum=declared_sum)
+        return stream.record(
+            hidden_states, bind_update(update, forward_batch), declared_sum=declared_sum
+        )
 
     def _next_input_can_scatter(self, steps) -> bool:
         """Whether the next layer's input can run this layer's move of its FFN
@@ -274,6 +280,14 @@ class ExitPolicy:
             # A reduce-scatter completes the sum on its way back.
             owes_sum=steps.output.group is not None and not sum_in_reduce_scatter,
         )
+        custom = steps.output.sum_impl
+        custom_can_defer = (
+            custom.can_defer(forward_batch)
+            if custom is not None and custom.can_defer is not None
+            else None
+        )
+        if custom_can_defer is False:
+            return ExitDecision(False, sum_in_reduce_scatter, complete_now)
         defer_moe_finalize = (
             self.plan.fusions is not None
             and self.plan.fusions.can_defer_finalize(self.plan, forward_batch)
@@ -295,6 +309,7 @@ class ExitPolicy:
             steps,
             sum_in_reduce_scatter=sum_in_reduce_scatter,
             dp_step=dp_step,
+            custom_can_defer=custom_can_defer,
         )
         if defers:
             group = self.ffn_reduction_group(steps)
@@ -308,7 +323,13 @@ class ExitPolicy:
                     ),
                 )
             else:
-                wrap = partial(UnreducedOutput, group=group)
+                wrap = partial(
+                    UnreducedOutput,
+                    group=group,
+                    complete_sum=partial(custom.run, forward_batch=forward_batch)
+                    if custom is not None
+                    else None,
+                )
             complete = partial(_defer, wrap)
         elif (
             dp_step is not None
@@ -345,7 +366,13 @@ class ExitPolicy:
         chosen: the sum the output owes, the move back to where the next layer
         reads it, then the write-back into the residual for a layer that does
         it itself."""
-        if owes_sum:
+        if steps.output.sum_impl is not None:
+            if steps.output_move_completes_sum or dp_step is not None:
+                raise NotImplementedError(
+                    "custom output sums require their declared token rows"
+                )
+            hidden_states = steps.output.sum_impl.run(hidden_states, forward_batch)
+        elif owes_sum:
             hidden_states = sum_output(
                 hidden_states,
                 steps.output.group,
@@ -364,7 +391,7 @@ class ExitPolicy:
                 residual=residual,
                 forward_batch=forward_batch,
             )
-        update = steps.output.update
+        update = bind_update(steps.output.update, forward_batch)
         if residual is not None and (update.applied_at_exit or steps.writes_at_handoff):
             hidden_states = update.update(hidden_states, residual)
             residual = None
@@ -379,12 +406,18 @@ class ExitPolicy:
         return MixerExit(self, forward_batch, stream=stream)
 
     def ffn_exit(
-        self, forward_batch: ForwardBatch, *, stream: ResidualStream
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        stream: ResidualStream,
+        update_context=None,
     ) -> FfnExit:
         """Decide once how this layer's FFN output reduction completes. Use the
         result as a context manager around the FFN call when the FFN may hand
         off its MoE finalize, then call ``finish``."""
-        return FfnExit(self, forward_batch, stream=stream)
+        return FfnExit(
+            self, forward_batch, stream=stream, update_context=update_context
+        )
 
     def _defers_sum(
         self,
@@ -393,6 +426,7 @@ class ExitPolicy:
         *,
         sum_in_reduce_scatter: bool,
         dp_step: Optional[Callable],
+        custom_can_defer: Optional[bool] = None,
     ) -> bool:
         """Whether the FFN leaves its output's all-reduce to the next layer's
         input when no fused kernel takes it: when the next layer would run the
@@ -401,7 +435,11 @@ class ExitPolicy:
         the scatter the next input runs."""
         return (
             steps.exit.may_defer_sum
-            and _batch_allows_deferred_sum(forward_batch, steps.exit, self.plan)
+            and (
+                custom_can_defer
+                if custom_can_defer is not None
+                else _batch_allows_deferred_sum(forward_batch, steps.exit, self.plan)
+            )
             and not sum_in_reduce_scatter
             and dp_step is None
         )
@@ -490,7 +528,7 @@ class MixerExit:
         produced = steps.output
         self._stream = stream
         self._forward_batch = forward_batch
-        self._update = produced.update
+        self._update = bind_update(produced.update, forward_batch)
         self._group = produced.group
         self._declared_sum = produced.group if produced.always_partial else None
         self._defers = steps.exit.defers_mixer_sum
@@ -552,6 +590,7 @@ class FfnExit:
         forward_batch: ForwardBatch,
         *,
         stream: ResidualStream,
+        update_context=None,
     ):
         self._stream = stream
         self.boundary = boundary
@@ -561,7 +600,7 @@ class FfnExit:
         completion = boundary._decide(forward_batch, steps)
         self.defer_moe_finalize = completion.defer_moe_finalize
         self._complete = completion.complete
-        self._update = steps.output.update
+        self._update = bind_update(steps.output.update, forward_batch, update_context)
         # A reduce-scatter that completes the sum on the way back is the
         # next input's only on an input-scattered batch.
         self._declared_sum = steps.exit.sum_left_to_next_input

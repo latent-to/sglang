@@ -105,6 +105,21 @@ def _unguarded_sums(source: str, completes_own_sum=frozenset()):
     def visit(node, guarded):
         if _is_vocab_parallel(node):
             return
+        if isinstance(node, ast.ClassDef):
+            bases = {ast.unparse(base) for base in node.bases}
+            owner = (
+                "finish"
+                if "ComputeTransport" in bases
+                else "complete"
+                if "DeferredFinalize" in bases
+                else None
+            )
+            if owner is not None:
+                for child in node.body:
+                    if isinstance(child, ast.FunctionDef) and child.name == owner:
+                        continue
+                    visit(child, guarded)
+                return
         if isinstance(node, ast.FunctionDef) and node.name in completes_own_sum:
             return
         if isinstance(node, ast.If) and _requires(node.test, guards):

@@ -114,6 +114,72 @@ def final_norm(
     )
 
 
+def read_output(hidden_states, forward_batch, read, norm):
+    """Consume the stack's output with an explicitly declared final read.
+
+    This entry accepts producer updates through ``accepts_pending_update``.
+    Completion candidates see the actual update before any collective; their
+    fallback completes the owed output once, then applies update_and_read.
+    Ordinary model final norms continue to use final_norm().
+    """
+    from sglang.srt.layers.layer_boundary.layout import _sum_group
+    from sglang.srt.layers.layer_boundary.output import (
+        DeferredFinalize,
+        UnreducedOutput,
+    )
+    from sglang.srt.layers.layer_boundary.prepare import _run_read_fusions
+    from sglang.srt.layers.layer_boundary.residual import takes_pending_update
+    from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
+
+    stream = stream_of(forward_batch)
+    stream.check(hidden_states)
+    pending = stream.pending
+    try:
+        if pending is None:
+            value = stream.residual
+            if value is None:
+                value = read.init_residual(hidden_states)
+            return read.read(value, norm)
+        if not takes_pending_update(read, pending.update):
+            raise NotImplementedError(
+                "final read does not accept the pending producer update"
+            )
+        owed = pending.owed
+        candidates = tuple(
+            f
+            for f in read.completing_fusions
+            if not f.scatters
+            and (
+                (isinstance(owed, DeclaredSum) and f.completes is owed.group)
+                or (
+                    isinstance(owed, UnreducedOutput)
+                    and f.carried
+                    and owed.reduce_to_dp_local is None
+                    and _sum_group(f.completes) is owed.group
+                )
+                or (isinstance(owed, DeferredFinalize) and f.carried)
+            )
+        )
+        result = _run_read_fusions(
+            candidates,
+            pending.for_boundary(),
+            stream.residual,
+            forward_batch,
+            norm,
+            read=read,
+            update=pending.update,
+        )
+        if result is None:
+            value = pending.complete()
+            result = read.update_and_read(pending.update, value, stream.residual, norm)
+        return result
+    finally:
+        # The terminal consumer owns the result, including on an exception.
+        if pending is not None:
+            pending.release()
+        forward_batch.residual_stream = None
+
+
 def to_pp(hidden_states, forward_batch):
     """Export hidden_states and residual as PPProxyTensors.
 
