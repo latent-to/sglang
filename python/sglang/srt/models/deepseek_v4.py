@@ -472,7 +472,8 @@ def _apply_wo_a_bf16_matmul(
     emit_fp8: bool = False,
 ) -> torch.Tensor | Mxfp8SwizzledInput | Fp8GridActivation | Mxfp8Activation:
     # o [T, G, D] @ wo_a [G, R, D] -> [T, G, R]; the fast paths below are gated
-    # on the exact validated TP4 shapes and write token-major output directly.
+    # on the TP4 (2 local groups) and TP2 (4 local groups) shapes and write
+    # token-major output directly.
     global _wo_a_aiter_batched_gemm_disabled
     # the gfx950 routes, like the CUDA ones, are V4.1's (fast_path); DSv4 keeps the
     # aiter batched GEMM / einsum below
@@ -510,17 +511,20 @@ def _apply_wo_a_bf16_matmul(
         or hip_decode_verify
         or (hip_fast_path and is_prefill and 4096 <= o.shape[0] <= 65536)
     ) and (
-        o.shape[1:] == (2, 4096)
-        and wo_a.shape == (2, 1024, 4096)
+        o.shape[1] in (2, 4)
+        and o.shape[2] == 4096
+        and wo_a.shape == (o.shape[1], 1024, 4096)
         and o.dtype == wo_a.dtype == torch.bfloat16
         and o.stride(2) == 1
         and o.stride(1) == 4096
-        and o.stride(0) >= 8192
+        and o.stride(0) >= o.shape[1] * 4096
         and wo_a.is_contiguous()
     ):
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
-        if 2 <= o.shape[0] <= 8:
+        # The split-K small-batch kernels are written for 2 groups; 4 groups
+        # take the strided bmm below.
+        if 2 <= o.shape[0] <= 8 and o.shape[1] == 2:
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
@@ -1261,7 +1265,9 @@ class MQALayer(MqaAttentionBase):
             and not self.use_npu_arch35_mxfp8_wo_a
             and self.wo_a.weight.dtype == torch.bfloat16
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
-            and (self.n_local_groups, self.o_lora_rank) == (2, 1024)
+            # 2 local groups at TP4, 4 at TP2; the kernel is built per group count.
+            and self.n_local_groups in (2, 4)
+            and self.o_lora_rank == 1024
         )
         if _is_hip:
             _hip.init_mqa_layer(self, quant_config)
@@ -1342,7 +1348,7 @@ class MQALayer(MqaAttentionBase):
             and get_platform().is_blackwell
             and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
             and q.ndim == 2
-            and 0 < q.shape[0] <= 8
+            and 0 < q.shape[0] <= 64
             and q.shape[1] == 1280
             and q.stride(1) == 1
             and getattr(method, "mxfp8_dense_backend", None)
@@ -2464,7 +2470,9 @@ class MQALayer(MqaAttentionBase):
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
             if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
-                o = attn_q.new_empty(
+                # TRT-LLM receives FP8 Q but returns BF16 attention values;
+                # the graph bridge must not quantize them back to Q's dtype.
+                o = x.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
                 bcg_deepseek_v4_attention_with_output(
@@ -3326,7 +3334,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         facts, dropped by `refresh_mhc_norm_weight_cache`. Row capacity is the
         dynamic half, checked per forward via `can_fuse_all_reduce`."""
         return (
-            get_parallel().tp_size == self.self_attn.attn_tp_size == 4
+            get_parallel().tp_size == self.self_attn.attn_tp_size
+            and get_parallel().tp_size in (2, 4)
             and self.self_attn.wo_b.reduce_results
             and self.local_boundary.norm_fusable
             and mhc.can_fuse_post(self.hc_cfg)
@@ -3336,7 +3345,7 @@ class DeepseekV4DecoderLayer(nn.Module):
     def _can_fuse_ffn_mhc(self) -> bool:
         """The MoE counterpart of `_can_fuse_attn_mhc`."""
         return (
-            self.mlp.tp_size == 4
+            self.mlp.tp_size in (2, 4)
             and get_moe_a2a_backend().is_none()
             and not self.mlp._shared_expert_tp1
             and not should_skip_post_experts_all_reduce(is_tp_path=True)
@@ -3401,13 +3410,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             fuse_all_reduce_mhc = self._can_fuse_ffn_mhc and can_fuse_all_reduce(
                 x.shape[0], self.hc_cfg.hidden
             )
-            y = self._run_moe_ffn_dp_sync(
-                x,
-                forward_batch,
-                input_ids=input_ids,
-                input_ids_global=input_ids_global,
-                return_moe_output=fuse_all_reduce_mhc,
-            )
+            from sglang.srt.models.deepseek_v4_prune import decode_rows
+
+            with decode_rows(forward_batch):
+                y = self._run_moe_ffn_dp_sync(
+                    x,
+                    forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    return_moe_output=fuse_all_reduce_mhc,
+                )
             del x
             return mhc.run_moe_post(
                 self.ffn_hc,
@@ -5005,7 +5017,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         # The only deployments whose fused-collective gates can fire; registration
         # must happen eagerly here, before graph capture.
-        if get_platform().is_blackwell and get_parallel().tp_size == 4:
+        if get_platform().is_blackwell and get_parallel().tp_size in (2, 4):
             from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
                 register_fused_all_reduce_comm,
             )

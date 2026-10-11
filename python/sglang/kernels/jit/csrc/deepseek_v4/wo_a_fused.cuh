@@ -3,11 +3,11 @@
 // Collapses three launches on the DSV4 decode/verify path (fused_rope_inplace,
 // _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched kernel.
 //
-//   x [T, 2, 4096] bf16 (a strided view of a [T, 64, 512] attention output)
-//   W [2, 1024, 4096] bf16
-//   -> q [T, 2048] e4m3 + scales [8192] ue8m0, and/or y [T, 2048] bf16
+//   x [T, G, 4096] bf16 (a strided view of a [T, 64, 512] attention output)
+//   W [G, 1024, 4096] bf16, G local groups (2 at TP4, 4 at TP2)
+//   -> q [T, G*1024] e4m3 + scales [G*4096] ue8m0, and/or y [T, G*1024] bf16
 //
-// Decomposition: the 2048 output columns split into 32 N-tiles of 64, one per
+// Decomposition: the G*1024 output columns split into G*16 N-tiles of 64, one per
 // cluster; K splits 8 ways across the cluster's CTAs, so each CTA owns exactly
 // one of the group's 8 heads -- and therefore exactly one 64-wide RoPE window,
 // which is exactly one staged K-tile. That is what folds the rope launch in
@@ -250,15 +250,16 @@ namespace sglang::wo_a_fused {
 // Shape
 // ---------------------------------------------------------------------------
 /**
- * \brief Compile-time shape for the TP4 WO-A decomposition.
+ * \brief Compile-time shape for the WO-A decomposition.
  *
  * \tparam kMaxTokens Token capacity; also the MMA's N axis, so a multiple of 8.
+ * \tparam kGroups    Local attention groups on this rank: 2 at TP4, 4 at TP2.
  *
- * 2048 output columns split into kClusters N-tiles of kNTile, one per cluster;
+ * kNOut output columns split into kClusters N-tiles of kNTile, one per cluster;
  * K splits kSplitK ways across the cluster's CTAs, giving each CTA exactly one
  * of the group's 8 heads and therefore exactly one RoPE window.
  */
-template <int kMaxTokens>
+template <int kMaxTokens, int kGroups>
 struct WoATrait {
   static_assert(kMaxTokens == 16 || kMaxTokens == 32, "only the x16/x32 TMEM loads are wired up");
 
@@ -273,7 +274,7 @@ struct WoATrait {
   static constexpr int kHeadStages = kHeadDim / kBlockK;
   static constexpr int kHeadsPerCta = kKSlab / kHeadDim;
   static constexpr int kRopeDim = 64;
-  static constexpr int kNOut = 2048;  // 2 groups x 1024
+  static constexpr int kNOut = kGroups * 1024;
   // One UE8M0 byte per MXFP8 block, for 128 padded token rows.
   static constexpr int kScaleBytes = (kNOut / 32) * 128;
   static constexpr int kClusters = kNOut / kNTile;
@@ -314,7 +315,8 @@ struct WoATrait {
     uint64_t tmem_ld_done;
     uint32_t taddr;
   };
-  // 2 CTAs/SM needs <= 113 KiB each; the 32-cluster wave depends on it.
+  // 2 CTAs/SM needs <= 113 KiB each; the 32-cluster wave depends on it (4
+  // groups launch 64 clusters, so they take two waves).
   static_assert(sizeof(Smem) <= 115712, "smem would drop the kernel to 1 CTA/SM");
 };
 
@@ -689,19 +691,19 @@ namespace sglang {
 /**
  * \brief Fused inverse-RoPE + grouped WO-A BF16 GEMM + MXFP8 quantization.
  *
- * \param x         [T, 2, 4096] bf16 attention output; a strided view of a
+ * \param x         [T, kGroups, 4096] bf16 attention output; a strided view of a
  *                  [T, 64, 512] buffer, so only the group and K axes need to be
  *                  contiguous and the row stride is read off the tensor.
- * \param w         [2, 1024, 4096] bf16, contiguous.
+ * \param w         [kGroups, 1024, 4096] bf16, contiguous.
  * \param freqs     [S, 64] fp32 rotation table, (cos0, sin0, cos1, sin1, ...).
  * \param positions [T] absolute token positions, int32 or int64.
  * Exactly one output form must be supplied: either (\p q, \p scales) or \p y.
  *
- * \param q         [T, 2048] e4m3 quantized output; pairs with \p scales.
- * \param scales    [8192] uint8 UE8M0 scales in FlashInfer's 128x4 swizzle.
- * \param y         [T, 2048] bf16, the result before quantization.
+ * \param q         [T, kNOut] e4m3 quantized output; pairs with \p scales.
+ * \param scales    [kScaleBytes] uint8 UE8M0 scales in FlashInfer's 128x4 swizzle.
+ * \param y         [T, kNOut] bf16, the result before quantization.
  */
-template <int kMaxTokens>
+template <int kMaxTokens, int kGroups>
 inline void wo_a_fused_run(
     tvm::ffi::TensorView x,
     tvm::ffi::TensorView w,
@@ -712,7 +714,7 @@ inline void wo_a_fused_run(
     tvm::ffi::Optional<tvm::ffi::TensorView> y) {
   using namespace host;
   using namespace wo_a_fused;  // make_map, wo_a_fused_kernel
-  using Trait = WoATrait<kMaxTokens>;
+  using Trait = WoATrait<kMaxTokens, kGroups>;
   constexpr int kMMax = Trait::kMMax;
   constexpr int kNTile = Trait::kNTile;
   constexpr int kBlockK = Trait::kBlockK;
@@ -732,12 +734,12 @@ inline void wo_a_fused_run(
   SymbolicDevice device_;
   device_.set_options<kDLCUDA>();
 
-  TensorMatcher({T, 2, kGroupK})  //
+  TensorMatcher({T, kGroups, kGroupK})  //
       .with_strides({XS0, kGroupK, 1})
       .with_dtype<bf16_t>()
       .with_device<kDLCUDA>(device_)
       .verify(x);
-  TensorMatcher({2, kNOut / 2, kGroupK})  //
+  TensorMatcher({kGroups, kNOut / kGroups, kGroupK})  //
       .with_dtype<bf16_t>()
       .with_device<kDLCUDA>(device_)
       .verify(w);
@@ -773,9 +775,9 @@ inline void wo_a_fused_run(
   const int64_t x_stride0 = XS0.unwrap();
   const DLDevice device = device_.unwrap();
   CHECK_HOST(m >= 1 && m <= kMMax) << "wo_a_fused supports 1 <= T <= " << kMMax << ", got " << m;
-  CHECK_HOST(x_stride0 >= 2 * kGroupK) << "x row stride must cover both groups, got " << x_stride0;
+  CHECK_HOST(x_stride0 >= kGroups * kGroupK) << "x row stride must cover every group, got " << x_stride0;
   const auto w_map = make_map(w.data_ptr(), kGroupK, kNOut, kGroupK * 2, kBlockK, kNTile);
-  const auto x_map = make_map(x.data_ptr(), 2 * kGroupK, m, x_stride0 * 2, kBlockK, kMMax);
+  const auto x_map = make_map(x.data_ptr(), kGroups * kGroupK, m, x_stride0 * 2, kBlockK, kMMax);
   const auto launch = [&](const auto* pos) {
     using PosT = std::decay_t<decltype(*pos)>;
     constexpr auto kernel = wo_a_fused_kernel<Trait, PosT>;
