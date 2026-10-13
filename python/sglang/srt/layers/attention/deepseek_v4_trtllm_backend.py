@@ -394,8 +394,19 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
 
         # Build VarSeq metadata from the same extend lengths as the sparse tables.
         core = self.forward_metadata.core_attn_metadata
+        tail = getattr(self.forward_metadata, "late_layer_tail", None)
         if core.trtllm_prefill_qmeta is None:
-            extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+            if tail is None:
+                extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+                seq_lens_i32 = forward_batch.seq_lens.to(torch.int32)
+            else:
+                # Decoder bounded replay: the late layers' queries are each request's
+                # tail, and their window is floored at the tail start (window KV before
+                # it is never written). The kernel counts causal window slots from
+                # seq_lens, so it gets the tail length: slot k of tail row j is valid
+                # exactly when k <= j, which is the floored window the table carries.
+                extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+                seq_lens_i32 = tail.extend_seq_lens.to(torch.int32)
             assert extend_seq_lens_cpu is not None and len(extend_seq_lens_cpu) > 0
             batch_size = len(extend_seq_lens_cpu)
             cum_lens = [0] * (batch_size + 1)
@@ -404,7 +415,6 @@ class DeepseekV4TrtllmAttnBackend(DeepseekV4AttnBackend):
             sum_q = cum_lens[-1]
             max_q_len = max(int(x) for x in extend_seq_lens_cpu)
             assert 0 < sum_q <= num_qo_padded, f"{sum_q=} {num_qo_padded=}"
-            seq_lens_i32 = forward_batch.seq_lens.to(torch.int32)
             assert seq_lens_i32.shape == (batch_size,), f"{seq_lens_i32.shape=}"
             core.trtllm_prefill_qmeta = (
                 self._move_to_device(cum_lens),

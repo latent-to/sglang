@@ -267,12 +267,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         ("HiSparse", cfg.enable_hisparse),
         ("the unified KV layout", is_unified_kv_triton()),
         (
-            "TRT-LLM with SWA bounded replay",
+            # Decoder bounded replay runs on TRT-LLM: its prefill takes the late
+            # layers' tail lengths (deepseek_v4_trtllm_backend._forward_trtllm_prefill).
+            "TRT-LLM with encoder SWA bounded replay",
             cfg.dsv4_attn_backend == "trtllm"
-            and (
-                cfg.enable_encoder_swa_bounded_replay
-                or cfg.enable_decoder_swa_bounded_replay
-            ),
+            and cfg.enable_encoder_swa_bounded_replay,
         ),
         ("two-batch overlap", cfg.enable_two_batch_overlap),
         ("pipeline parallelism", cfg.pp_size > 1),
