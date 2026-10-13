@@ -38,9 +38,13 @@ def _jit_main_q_norm_rope_module(
     head_dim: int,
     rope_dim: int,
     apply_norm: bool,
+    out_fp8: bool = False,
 ):
-    """Main MLA path Q kernel: rmsnorm-self + RoPE, warp per (token, head)."""
-    args = make_cpp_args(dtype, head_dim, rope_dim, apply_norm, is_arch_support_pdl())
+    """Main MLA path Q kernel: rmsnorm-self + RoPE, warp per (token, head);
+    out_fp8 writes the FP8 E4M3 output in the same launch."""
+    args = make_cpp_args(
+        dtype, head_dim, rope_dim, apply_norm, is_arch_support_pdl(), out_fp8
+    )
     return load_jit(
         make_name("main_q_norm_rope"),
         *args,
@@ -175,6 +179,18 @@ def fused_q_norm_rope(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> None:
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    if q_output.dtype == torch.float8_e4m3fn and not (_is_xpu or _is_hip):
+        # One launch: the kernel rounds to BF16 and casts to FP8 as torch does,
+        # byte for byte what the BF16 kernel plus copy_ below produces.
+        assert q_input.dtype == torch.bfloat16
+        assert q_output.shape == q_input.shape
+        assert q_output.device == q_input.device
+        module = _jit_main_q_norm_rope_module(
+            q_input.dtype, q_input.shape[-1], freqs_real.shape[-1], eps is not None, True
+        )
+        module.forward(q_input, q_output, freqs_real, positions, eps or 0.0)
+        return
     # Reuse the BF16 kernel and preserve its rounding before FP8 conversion.
     # Keep the temporary separate from q_input: callers may reuse the input.
     fp8_output = q_output if q_output.dtype == torch.float8_e4m3fn else None
@@ -183,7 +199,6 @@ def fused_q_norm_rope(
         assert q_output.shape == q_input.shape
         assert q_output.device == q_input.device
         q_output = torch.empty_like(q_input)
-    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = q_input.shape[-1]
     rope_dim = freqs_real.shape[-1]
     if _is_xpu:
