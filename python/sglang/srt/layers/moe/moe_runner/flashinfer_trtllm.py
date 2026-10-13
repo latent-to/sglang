@@ -193,6 +193,62 @@ def _routing_top_k(routing: FlashInferRouting) -> int:
     return ids.shape[1]
 
 
+# Launch tactic [token tile, kernel config] of FlashInfer's routed NVFP4 expert kernels (FC1, FC2) for a
+# decode batch. FlashInfer picks it at boot by timing the warmup forward, which routes every row to the
+# same top_k experts; on that it prefers the 2-CTA-cluster FC1 (t128x32x512 m256x32x64 c2x1x1). With many
+# experts in a call the 1-CTA FC1 at the same 32-token tile (t128x32x512_s4 m128x32x64 c1x1x1) streams
+# their weights 24% faster: FC1 + FC2 at 108 rows / 72 experts 145 -> 118 us, at 60 rows / 48 experts
+# 103 -> 84 us, within 1-3% of the best of all 576 tactics from 36 rows up at 6-96 experts (B300,
+# mb_moe.py, mb/mb-sweep-r*.jsonl, mb/mb-fam-gpu*.jsonl). Small batches keep the tuner's own small tiles.
+# Tactics differ in launch shape only; per-(row, expert) outputs are bit-identical.
+_EXPERT_DECODE_MAX_ROWS = 256
+_EXPERT_DECODE_SHAPE = (5120, 1152)  # hidden, intermediate per rank: the shape the tactics were timed on
+_EXPERT_TACTIC_OP = "flashinfer::trtllm_fp4_block_scale_moe"
+_expert_tactic_pin: contextvars.ContextVar = contextvars.ContextVar("expert_tactic_pin", default=None)
+_expert_tactic_pin_installed = False
+
+
+def _expert_decode_tactic(rows: int, top_k: int, hidden: int, intermediate: int) -> Optional[list]:
+    if rows > _EXPERT_DECODE_MAX_ROWS or top_k != 6 or (hidden, intermediate) != _EXPERT_DECODE_SHAPE:
+        return None
+    if rows <= 8:
+        return [8, 106]
+    if rows <= 16:
+        return [16, 92]
+    return [32, 122]
+
+
+def _install_expert_tactic_pin() -> None:
+    """Make FlashInfer's tuner hand the routed expert op the pinned tactic while one is set."""
+    global _expert_tactic_pin_installed
+    if _expert_tactic_pin_installed:
+        return
+    from flashinfer.autotuner import AutoTuner
+
+    stock_choose_one = AutoTuner.choose_one
+
+    def choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs):
+        tactic = _expert_tactic_pin.get()
+        if tactic is not None and custom_op == _EXPERT_TACTIC_OP:
+            return runners[0], tactic
+        return stock_choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs)
+
+    AutoTuner.choose_one = choose_one
+    _expert_tactic_pin_installed = True
+    logger.info("FlashInfer routed expert op: decode launch tactic pinned by _expert_decode_tactic")
+
+
+@contextmanager
+def _pinned_expert_tactic(tactic: Optional[list]) -> Generator[None, None, None]:
+    if tactic is not None:
+        _install_expert_tactic_pin()
+    token = _expert_tactic_pin.set(tactic)
+    try:
+        yield
+    finally:
+        _expert_tactic_pin.reset(token)
+
+
 def _align_fp8_moe_weights(
     w13: torch.Tensor,
     w2: torch.Tensor,
@@ -1486,39 +1542,46 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     if use_routed_topk:
         routing = _get_routing_for_flashinfer_routed(topk_output)
-        result = trtllm_fp4_block_scale_routed_moe(
-            topk_ids=routing,
-            routing_bias=None,
-            hidden_states=hs_fp4,
-            hidden_states_scale=hs_scale,
-            gemm1_weights=quant_info.w13_weight,
-            gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
-            gemm1_bias=None,
-            gemm1_alpha=quant_info.gemm1_alpha,
-            gemm1_beta=quant_info.gemm1_beta,
-            gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
-            gemm2_weights=quant_info.w2_weight,
-            gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
-            gemm2_bias=None,
-            output1_scale_scalar=quant_info.g1_scale_c,
-            output1_scale_gate_scalar=quant_info.g1_alphas,
-            output2_scale_scalar=quant_info.g2_alphas,
-            per_token_scale=per_token_scale,
-            num_experts=quant_info.global_num_experts,
-            top_k=_routing_top_k(routing),
-            n_group=0,
-            topk_group=0,
-            intermediate_size=quant_info.intermediate_size_per_partition,
-            local_expert_offset=quant_info.local_expert_offset,
-            local_num_experts=quant_info.local_num_experts,
-            routed_scaling_factor=None,
-            routing_method_type=1,  # Unused, but must be 1 to pass validation.
-            do_finalize=not defer_finalize,
-            activation_type=activation_type,
-            tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
-            output=symm_output,
-            enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
+        decode_tactic = _expert_decode_tactic(
+            num_tokens,
+            _routing_top_k(routing),
+            hidden_size,
+            quant_info.intermediate_size_per_partition,
         )
+        with _pinned_expert_tactic(decode_tactic):
+            result = trtllm_fp4_block_scale_routed_moe(
+                topk_ids=routing,
+                routing_bias=None,
+                hidden_states=hs_fp4,
+                hidden_states_scale=hs_scale,
+                gemm1_weights=quant_info.w13_weight,
+                gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
+                gemm1_bias=None,
+                gemm1_alpha=quant_info.gemm1_alpha,
+                gemm1_beta=quant_info.gemm1_beta,
+                gemm1_clamp_limit=quant_info.gemm1_clamp_limit,
+                gemm2_weights=quant_info.w2_weight,
+                gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
+                gemm2_bias=None,
+                output1_scale_scalar=quant_info.g1_scale_c,
+                output1_scale_gate_scalar=quant_info.g1_alphas,
+                output2_scale_scalar=quant_info.g2_alphas,
+                per_token_scale=per_token_scale,
+                num_experts=quant_info.global_num_experts,
+                top_k=_routing_top_k(routing),
+                n_group=0,
+                topk_group=0,
+                intermediate_size=quant_info.intermediate_size_per_partition,
+                local_expert_offset=quant_info.local_expert_offset,
+                local_num_experts=quant_info.local_num_experts,
+                routed_scaling_factor=None,
+                routing_method_type=1,  # Unused, but must be 1 to pass validation.
+                do_finalize=not defer_finalize,
+                activation_type=activation_type,
+                tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
+                output=symm_output,
+                enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
+            )
         if defer_finalize:
             result = _make_deferred_finalize_output(
                 result, top_k=_routing_top_k(routing)
