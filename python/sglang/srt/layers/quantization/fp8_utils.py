@@ -1625,6 +1625,47 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return q_input.contiguous(), scale_u8.contiguous()
 
 
+def _mxfp8_decode_tactic(m: int, n: int, device: torch.device):
+    """Launch tactic for the CuTe MXFP8 dense GEMM at decode batch sizes, or None
+    for FlashInfer's untuned default.
+
+    The default above 32 rows is a 128x128 tile over (tokens, outputs): 14-40 CTAs
+    for this model's layers, each streaming a 128 x K weight tile and the whole
+    activation tile, on a GPU with ~150 SMs. Swapping the operands and halving the
+    token tile spreads the same bytes over more SMs: 20-25% less time per launch
+    on B300 for as long as the grid still fits one wave of SMs, slower once it
+    does not (measured 36-2048 rows on all five MXFP8 layer shapes of the model).
+    Tile and operand order do not change the K reduction order, so the output is
+    bit-identical to the default and row-wise batch invariance holds.
+    """
+    if m <= 32:
+        return None
+    ctas = -(-n // 128) * -(-m // 64)
+    if ctas > torch.cuda.get_device_properties(device).multi_processor_count:
+        return None
+    return ((128, 64), (1, 1), True, False, 1)
+
+
+def _cute_dsl_mm_mxfp8_with_tactic(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+    tactic,
+) -> torch.Tensor:
+    """mm_mxfp8's cute-dsl path with the launch tactic given by the caller:
+    mm_mxfp8 takes none, and its autotuner would pick per M bucket."""
+    from flashinfer.gemm import gemm_base
+    from flashinfer.utils import get_compute_capability
+
+    major, minor = get_compute_capability(a.device)
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype)
+    out = torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=out_dtype)
+    runner(inputs=[a, b, a_scale, b_scale, out_dtype, out, None], tactic=tactic)
+    return out
+
+
 def flashinfer_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1672,7 +1713,16 @@ def flashinfer_mxfp8_blockscaled_linear(
     else:
         weight_scale_t = weight_scale.t() if weight_scale.ndim == 2 else weight_scale
 
-    if pin_tactic:
+    decode_tactic = (
+        _mxfp8_decode_tactic(q_input.shape[0], weight.shape[0], q_input.device)
+        if pin_tactic and backend == "cute-dsl"
+        else None
+    )
+    if decode_tactic is not None:
+        output = _cute_dsl_mm_mxfp8_with_tactic(
+            q_input, weight.t(), x_scale_u8, weight_scale_t, output_dtype, decode_tactic
+        )
+    elif pin_tactic:
         from flashinfer.autotuner import autotune
 
         with autotune(False, skip_ops={"mxfp8_gemm"}):
