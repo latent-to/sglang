@@ -64,13 +64,36 @@ load_rope_first_cos_sin(const float* __restrict__ cos_sin_cache, int32_t lane_id
   return freq;
 }
 
+// The float -> float8_e4m3fn cast torch's copy_ does on this device, reproduced bit for bit
+// (checked over every BF16 bit pattern by mb_f1.py): round to nearest even, denormals
+// below 2^-6, anything that rounds past 448 saturates to 0x7E with its sign (infinities
+// too), NaN is 0x7F without a sign. The FP8 output of the Q kernel must equal a torch
+// copy_ of its BF16 output into an FP8 tensor, which is what attention has been fed.
+SGL_DEVICE uint8_t torch_fp8_e4m3fn(float value) {
+  constexpr uint32_t kFp8Max = UINT32_C(1087) << 20;     // 480.0f
+  constexpr uint32_t kDenormMask = UINT32_C(141) << 23;  // (127 - 7) + (23 - 3) + 1
+  const uint32_t raw = __float_as_uint(value);
+  const uint32_t sign = raw & UINT32_C(0x80000000);
+  const uint32_t bits = raw ^ sign;
+  // Both paths are computed and selected: no branch per element in the unrolled stores.
+  const uint32_t normal = (bits + (static_cast<uint32_t>(7 - 127) << 23) + 0x7FFFF + ((bits >> 20) & 1)) >> 20;
+  const uint32_t denormal =
+      __float_as_uint(__fadd_rn(__uint_as_float(bits), __uint_as_float(kDenormMask))) - kDenormMask;
+  uint32_t result = bits < (UINT32_C(121) << 23) ? denormal : normal;
+  result = (bits >= kFp8Max || result > UINT32_C(0x7e)) ? UINT32_C(0x7e) : result;
+  result |= sign >> 24;
+  return static_cast<uint8_t>(bits > UINT32_C(0x7F800000) ? UINT32_C(0x7f) : result);
+}
+
 // ============================================================================
 // Q kernel: warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
+// kOutFp8 writes q_out as FP8 E4M3 in the same launch: every value is rounded to
+// DType first, exactly as the DType output stores it, then cast as torch casts it.
 // ============================================================================
 
 struct FusedQNormRopeParams {
   const void* __restrict__ q_input;     // (B, num_q_heads, kHeadDim) DType
-  void* __restrict__ q_output;          // (B, num_q_heads, kHeadDim) DType
+  void* __restrict__ q_output;          // (B, num_q_heads, kHeadDim) DType, or FP8 E4M3 (kOutFp8)
   const float* __restrict__ freqs_cis;  // (max_pos, kRopeDim) fp32 (re/im interleaved)
   const void* __restrict__ positions;   // (B,) PosT
   int64_t q_input_stride_batch;
@@ -80,7 +103,14 @@ struct FusedQNormRopeParams {
   float eps;
 };
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kUsePDL, bool kApplyNorm>
+template <
+    typename DType,
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    typename PosT,
+    bool kUsePDL,
+    bool kApplyNorm,
+    bool kOutFp8>
 Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams params) {
   using namespace device;
 
@@ -95,6 +125,8 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
   static_assert(kRopeDim == kWarpThreads * 2, "1 (real, imag) pair per lane");
 
   using Storage = AlignedVector<DType, kVecSize>;
+  using Fp8Storage = AlignedVector<uint8_t, kVecSize>;
+  constexpr int64_t kOutBytes = kOutFp8 ? 1 : static_cast<int64_t>(sizeof(DType));
 
   const auto warp_id = threadIdx.x / kWarpThreads;
   const auto lane_id = threadIdx.x % kWarpThreads;
@@ -107,8 +139,8 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
   const uint32_t head_id = work_id % params.num_q_heads;
   const auto input_ptr =
       static_cast<const DType*>(params.q_input) + batch_id * params.q_input_stride_batch + head_id * kHeadDim;
-  const auto output_ptr =
-      static_cast<DType*>(params.q_output) + batch_id * params.q_output_stride_batch + head_id * kHeadDim;
+  const auto output_ptr = static_cast<uint8_t*>(params.q_output) +
+                          (batch_id * params.q_output_stride_batch + head_id * kHeadDim) * kOutBytes;
   const auto position = static_cast<int32_t>(static_cast<const PosT*>(params.positions)[batch_id]);
 
   __shared__ Storage s_rope[kFusedQNumWarps][kRopeSize];
@@ -160,6 +192,13 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
     if (i == kLocalSize - 1 && is_rope_lane) {
       const auto rope_id = lane_id - (kWarpThreads - kRopeSize);
       s_rope[warp_id][rope_id] = input_vec[i];
+    } else if constexpr (kOutFp8) {
+      Fp8Storage bytes;
+#pragma unroll
+      for (int j = 0; j < kVecSize; ++j) {
+        bytes[j] = torch_fp8_e4m3fn(cast<float>(input_vec[i][j]));
+      }
+      tile::Memory<Fp8Storage>{lane_id, kWarpThreads}.store(output_ptr, bytes, i);
     } else {
       gmem.store(output_ptr, input_vec[i], i);
     }
@@ -194,14 +233,22 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
         x_real * freq_imag + x_imag * freq_real,
     };
   }
-  mem_elem.store(output_ptr + (kHeadDim - kRopeDim), cast<DType2>(rotated));
+  const auto rotated_dtype = cast<DType2>(rotated);
+  if constexpr (kOutFp8) {
+    const auto [out_real, out_imag] = cast<fp32x2_t>(rotated_dtype);
+    const auto pair = static_cast<uint16_t>(
+        torch_fp8_e4m3fn(out_real) | (static_cast<uint16_t>(torch_fp8_e4m3fn(out_imag)) << 8));
+    tile::Memory<uint16_t>{lane_id, kWarpThreads}.store(output_ptr + (kHeadDim - kRopeDim), pair);
+  } else {
+    mem_elem.store(output_ptr + (kHeadDim - kRopeDim) * kOutBytes, rotated_dtype);
+  }
 }
 
 // kApplyNorm = false only rotates the rope tail while copying Q into a (padded) output.
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kApplyNorm, bool kUsePDL>
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kApplyNorm, bool kUsePDL, bool kOutFp8 = false>
 struct FusedQNormRopeKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL, kApplyNorm>;
+  static constexpr auto kernel = fused_q_norm_rope<DType, kHeadDim, kRopeDim, PosT, kUsePDL, kApplyNorm, kOutFp8>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -221,11 +268,19 @@ struct FusedQNormRopeKernel {
         .with_dtype<DType>()
         .with_device(device_)
         .verify(q_input);
-    TensorMatcher({B, H, kHeadDim})  //
-        .with_strides({-1, kHeadDim, 1})
-        .with_dtype<DType>()
-        .with_device(device_)
-        .verify(q_output);
+    if constexpr (kOutFp8) {
+      TensorMatcher({B, H, kHeadDim})  //
+          .with_strides({-1, kHeadDim, 1})
+          .with_dtype<fp8_e4m3_t>()
+          .with_device(device_)
+          .verify(q_output);
+    } else {
+      TensorMatcher({B, H, kHeadDim})  //
+          .with_strides({-1, kHeadDim, 1})
+          .with_dtype<DType>()
+          .with_device(device_)
+          .verify(q_output);
+    }
     TensorMatcher({-1, kRopeDim})  //
         .with_dtype<float>()
         .with_device(device_)
