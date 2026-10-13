@@ -2224,39 +2224,42 @@ def _hc_mix_stats_partial_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    SLICES_PER_CTA: tl.constexpr = 1,
 ):
-    """Mixing dot products and row sum of squares over one K slice."""
+    """Mixing dot products and row sum of squares over SLICES_PER_CTA consecutive
+    K slices, each accumulated and stored on its own exactly as one slice per CTA."""
     pid_m = tl.program_id(0)
-    pid_s = tl.program_id(1)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, MIX_PAD)
     mask_m = offs_m < M
     mask_n = offs_n < MIX
     k_per_slice = K // NUM_SLICES
-    k_start = pid_s * k_per_slice
-    acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
-    sq = tl.zeros([BLOCK_M], dtype=tl.float32)
-    for kb in range(0, k_per_slice, BLOCK_K):
-        offs_k = k_start + kb + tl.arange(0, BLOCK_K)
-        mask_k = offs_k < k_start + k_per_slice
-        x_tile = tl.load(
-            x_ptr + offs_m[:, None] * x_stride_m + offs_k[None, :],
-            mask=mask_m[:, None] & mask_k[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        w_tile = tl.load(
-            w_ptr + offs_n[None, :] * w_stride_n + offs_k[:, None],
-            mask=mask_n[None, :] & mask_k[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        acc += tl.dot(x_tile, w_tile, input_precision=DOT_PRECISION)
-        sq += tl.sum(x_tile * x_tile, axis=1)
-    tl.store(
-        part_mix_ptr + (pid_s * M + offs_m[:, None]) * MIX + offs_n[None, :],
-        acc,
-        mask=mask_m[:, None] & mask_n[None, :],
-    )
-    tl.store(part_sq_ptr + pid_s * M + offs_m, sq, mask=mask_m)
+    for s in range(SLICES_PER_CTA):
+        pid_s = tl.program_id(1) * SLICES_PER_CTA + s
+        k_start = pid_s * k_per_slice
+        acc = tl.zeros([BLOCK_M, MIX_PAD], dtype=tl.float32)
+        sq = tl.zeros([BLOCK_M], dtype=tl.float32)
+        for kb in range(0, k_per_slice, BLOCK_K):
+            offs_k = k_start + kb + tl.arange(0, BLOCK_K)
+            mask_k = offs_k < k_start + k_per_slice
+            x_tile = tl.load(
+                x_ptr + offs_m[:, None] * x_stride_m + offs_k[None, :],
+                mask=mask_m[:, None] & mask_k[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            w_tile = tl.load(
+                w_ptr + offs_n[None, :] * w_stride_n + offs_k[:, None],
+                mask=mask_n[None, :] & mask_k[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            acc += tl.dot(x_tile, w_tile, input_precision=DOT_PRECISION)
+            sq += tl.sum(x_tile * x_tile, axis=1)
+        tl.store(
+            part_mix_ptr + (pid_s * M + offs_m[:, None]) * MIX + offs_n[None, :],
+            acc,
+            mask=mask_m[:, None] & mask_n[None, :],
+        )
+        tl.store(part_sq_ptr + pid_s * M + offs_m, sq, mask=mask_m)
 
 
 @triton.jit
@@ -2334,6 +2337,32 @@ def _num_slices_for(k: int) -> int:
         if blocks % n == 0:
             return n
     return 1
+
+
+# Decode launch shape of the stats kernel from 65 rows up (measured on B300, mb_hc.py).
+_HC_MIX_REGROUP_MIN_GRID_M = 5
+_HC_MIX_REGROUP_MAX_M = 256
+_HC_MIX_REGROUP_SLICES_PER_CTA = 2
+_HC_MIX_REGROUP_NUM_WARPS = 2
+
+
+def _stats_launch_shape(m: int, grid_m: int) -> Tuple[int, int]:
+    """(K slices per CTA, warps per CTA) of the stats kernel for a decode batch.
+
+    One slice per 4-warp CTA is 400-720 CTAs at 65-144 rows. While that grid is
+    still being placed, a kernel launched after it on any stream waits: in a served
+    verify step at 66+ rows the router and the shared-expert GEMM started 8-12 us
+    late in every layer, and alone on a GPU the kernel behind the gate GEMM starts
+    4.6-10.8 us late at 108-132 rows. Two slices per 2-warp CTA start it on time
+    at every row count measured (60-144) and take 4-6 us longer, inside the slack
+    the kernel has before the layer's finalize reads the triplet; below 65 rows
+    nothing waits, so the stock shape stays. Neither the slice grouping (a runtime
+    loop; unrolled it moves results by an ulp) nor the warp count changes a
+    slice's arithmetic: the triplet is bit-identical to the stock shape.
+    """
+    if grid_m < _HC_MIX_REGROUP_MIN_GRID_M or m > _HC_MIX_REGROUP_MAX_M:
+        return 1, _HC_MIX_NUM_WARPS
+    return _HC_MIX_REGROUP_SLICES_PER_CTA, _HC_MIX_REGROUP_NUM_WARPS
 
 
 def hc_mix_stats(x_flat: torch.Tensor, hc_fn: torch.Tensor, eps: float) -> torch.Tensor:
@@ -2492,7 +2521,9 @@ def hc_mix_stats_sinkhorn(
     part_mix = torch.empty((num_slices, m, mix), dtype=torch.float32, device=dev)
     part_sq = torch.empty((num_slices, m), dtype=torch.float32, device=dev)
     block_m = _block_m_for(m)
-    _hc_mix_stats_partial_kernel[(triton.cdiv(m, block_m), num_slices)](
+    grid_m = triton.cdiv(m, block_m)
+    slices_per_cta, num_warps = _stats_launch_shape(m, grid_m)
+    _hc_mix_stats_partial_kernel[(grid_m, num_slices // slices_per_cta)](
         x_flat,
         hc_fn,
         part_mix,
@@ -2507,7 +2538,8 @@ def hc_mix_stats_sinkhorn(
         BLOCK_M=block_m,
         BLOCK_K=_HC_MIX_BLOCK_K,
         DOT_PRECISION=_HC_MIX_DOT_PRECISION,
-        num_warps=_HC_MIX_NUM_WARPS,
+        SLICES_PER_CTA=slices_per_cta,
+        num_warps=num_warps,
         num_stages=_HC_MIX_NUM_STAGES,
     )
     if _is_hip:
