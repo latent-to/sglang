@@ -39,8 +39,9 @@ docker build --network=none --build-arg SOURCE_REVISION="$REVISION" \
 docker image inspect latent-sglang:dsv41-tp2 --format '{{.Id}}'
 ```
 
-The Dockerfile pins the parent by digest and copies only the changed source
-files. It does not upgrade dependencies or install a second serving stack.
+The Dockerfile pins the parent by digest and copies this branch's `python/sglang`
+over the parent's. It does not upgrade dependencies or install a second serving
+stack.
 
 ## Serve
 
