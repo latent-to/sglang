@@ -2,14 +2,14 @@
 
 This branch targets the NVIDIA NVFP4 checkpoint on two B300 GPUs, with four or
 sixteen concurrent interactive sessions. It starts from SGLang
-`d32d8fa0d1693189fda6727dd1b02caa3d26e367`, not moving upstream main.
+`684fea8af3b11a5b51ec9966c02959a32ad3421c`, the commit of the nightly image
+`lmsysorg/sglang:nightly-dev-20261014-684fea8a`, not moving upstream main.
 
 ## Changes
 
 - Enable the existing TP4 fused attention/MoE hyper-connection boundaries and
   custom all-reduce push plane at TP2.
-- Apply upstream PR 42654's routed NVFP4 deferred finalize and PR 43070's mHC
-  pipeline-stage improvement.
+- Apply upstream PR 42654's routed NVFP4 deferred finalize.
 - Parameterize fused inverse-RoPE/WO-A for four local attention groups and admit
   TP2's shape to the strided WO-A path.
 - Retain TRT-LLM attention, breakable prefill graphs, mega-mHC prefill, and
@@ -21,6 +21,12 @@ sixteen concurrent interactive sessions. It starts from SGLang
   routed-expert pruning at the target model's eager and captured MoE call sites.
   Do not replace nightly's model/attention implementation with the proposal's
   older SGLang 0.5.21 copies.
+
+One commit each on top of that: decoder SWA bounded replay on the TRT-LLM
+attention backend; a one-wave launch tactic for the MXFP8 dense GEMMs at decode
+batch sizes; an mHC mix-stats launch shape that does not delay the main stream;
+FP8 output inside the Q norm + RoPE kernel; a pinned launch tactic for the routed
+NVFP4 expert GEMM at decode batch sizes.
 
 **Pruning changes model numerics.** It drops experts selected by only one row,
 up to 40% of that row's routed weight, without renormalizing. It is
@@ -39,8 +45,9 @@ docker build --network=none --build-arg SOURCE_REVISION="$REVISION" \
 docker image inspect latent-sglang:dsv41-tp2 --format '{{.Id}}'
 ```
 
-The Dockerfile pins the parent by digest and copies only the changed source
-files. It does not upgrade dependencies or install a second serving stack.
+The Dockerfile pins the parent by digest and copies this branch's `python/sglang`
+over the parent's. It does not upgrade dependencies or install a second serving
+stack.
 
 ## Serve
 
@@ -94,3 +101,32 @@ uses the upstream GSM8K scorer on 200 fixed held-out test questions at each
 concurrency, retaining all replies and rejecting transport errors/truncation.
 This is a development serving baseline, not a mainnet qualification, settlement,
 or production cutover. Those authorities remain separate.
+
+The measurements behind this document were taken on the `d32d8fa0` line
+(`cacheon/dsv41-tp2-kernels`). This branch replays the same commits on a newer
+upstream base and has not been built or served yet.
+
+## Maintaining this fork
+
+- `main` mirrors `sgl-project/sglang` main and only ever fast-forwards
+  (`gh repo sync latent-to/sglang -b main`). Nothing of ours is committed to it.
+- `cacheon/dsv41-tp2-kernels` is the line the measurements were taken on. It is
+  append-only: new work lands there once it has a served measurement.
+- `cacheon/dsv41-tp2-upstream` (this branch) is the same patch series replayed
+  on the newest upstream nightly, and is rewritten at every refresh.
+
+A refresh:
+
+1. Pick the newest `lmsysorg/sglang:nightly-dev-<date>-<commit>` image. The base
+   is that image's commit, never upstream's moving head: the Dockerfile lays this
+   branch's package over that image, so the two must be the same source.
+2. `git rebase --onto <commit> <previous base> cacheon/dsv41-tp2-upstream`.
+3. A commit whose change upstream has merged is dropped, not merged by hand
+   (this refresh dropped the port of PR 42909: upstream merged PR 43736). A
+   hunk that upstream has merged disappears from its commit the same way
+   (PR 43070's mHC stage count).
+4. Put the image's digest in the Dockerfile and its commit at the top of this
+   file, then `git push --force-with-lease`.
+5. Build the image and repeat the serving experiment before anything is
+   measured against or launched from the refreshed branch. A clean replay is
+   not evidence that it serves or that it is as fast.

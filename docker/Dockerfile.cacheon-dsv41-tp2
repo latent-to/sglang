@@ -1,16 +1,8 @@
-# Rebuild the exact tested source overlay; no dependency upgrades.
-FROM lmsysorg/sglang@sha256:8346c975515af7ec6b2692faadd5332f789001f78f958335175d4d34e170537c
+# The lmsysorg/sglang nightly built at this branch's upstream base, with this branch's package on top.
+# The whole package is copied, not a list of files: the tree differs from the parent's only by this
+# branch's commits, and a per-file list went stale once (commits that never reached the image).
+FROM lmsysorg/sglang@sha256:ddae0e399d3d94f7827f16183301cf8dac4cf0eae0ef25590b7dac5881d713d8
 ARG SOURCE_REVISION
 LABEL org.opencontainers.image.source="https://github.com/latent-to/sglang"
 LABEL org.opencontainers.image.revision="$SOURCE_REVISION"
-COPY python/sglang/kernels/jit/csrc/deepseek_v4/wo_a_fused.cuh /sgl-workspace/sglang/python/sglang/kernels/jit/csrc/deepseek_v4/wo_a_fused.cuh
-COPY python/sglang/kernels/ops/attention/dsv4/wo_a.py /sgl-workspace/sglang/python/sglang/kernels/ops/attention/dsv4/wo_a.py
-COPY python/sglang/kernels/ops/layernorm/mhc.py /sgl-workspace/sglang/python/sglang/kernels/ops/layernorm/mhc.py
-COPY python/sglang/kernels/ops/layernorm/mxfp8_epilogue.py /sgl-workspace/sglang/python/sglang/kernels/ops/layernorm/mxfp8_epilogue.py
-COPY python/sglang/srt/arg_groups/deepseek_v4_hook.py /sgl-workspace/sglang/python/sglang/srt/arg_groups/deepseek_v4_hook.py
-COPY python/sglang/srt/arg_groups/overrides.py /sgl-workspace/sglang/python/sglang/srt/arg_groups/overrides.py
-COPY python/sglang/srt/layers/moe/fused_moe_triton/layer.py /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/layer.py
-COPY python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py /sgl-workspace/sglang/python/sglang/srt/layers/moe/moe_runner/flashinfer_trtllm.py
-COPY python/sglang/srt/models/deepseek_v2.py /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py
-COPY python/sglang/srt/models/deepseek_v4.py /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v4.py
-COPY python/sglang/srt/models/deepseek_v4_prune.py /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v4_prune.py
+COPY python/sglang /sgl-workspace/sglang/python/sglang
