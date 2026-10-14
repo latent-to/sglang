@@ -16,7 +16,10 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     fp4_index_logits_paged,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
-from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    deep_gemm_fp4_paged_mqa_logits,
+    flat_index_logits_tiles,
+)
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
@@ -117,16 +120,20 @@ def _index_q_and_weights(
     q_lora: torch.Tensor,
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
+    head_weights_raw: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """fp4 index queries ``[rows, heads, 64]`` int8 with ``[rows, heads]`` packed
-    ue8m0 scales, and fp32 head weights ``[rows, heads]``."""
+    ue8m0 scales, and fp32 head weights ``[rows, heads]``. ``head_weights_raw`` is
+    ``weights_proj(x)`` when the caller already issued it."""
     rows, heads = x.shape[0], indexer.n_local_heads
     q, _ = indexer.wq_b(q_lora)
+    if head_weights_raw is None:
+        head_weights_raw = indexer.head_weights_raw(x)
     q_fp4, q_sf, weights = index_q_rope_pack_weights(
         q.view(rows, heads, indexer.index_head_dim),
         torch.view_as_real(freqs_cis).flatten(-2),
         positions,
-        indexer.head_weights_raw(x),
+        head_weights_raw,
         indexer.head_weight_scale,
     )
     return q_fp4.view(rows, heads, 64), q_sf.view(rows, heads), weights
@@ -144,6 +151,7 @@ def get_deep_gemm_decode_data(
         q_lora=inputs.q_lora,
         freqs_cis=inputs.freqs_cis,
         positions=inputs.positions,
+        head_weights_raw=inputs.head_weights_raw,
     )
     bs = q_fp4.shape[0]
     q_fp4 = q_fp4.view(bs, 1, indexer.n_local_heads, 64)
@@ -156,6 +164,39 @@ def get_deep_gemm_decode_data(
         page_size=inputs.paged_metadata.compressed_page_size,
     )
     return DeepGEMMDecodeData(q_fp4, q_sf, weights, k_cache)
+
+
+def deep_gemm_decode_logits(data: DeepGEMMDecodeData, metadata) -> torch.Tensor:
+    """``[rows, max_compressed_seq_len]`` logits of a decode or verify batch in one
+    call. With a per-request verify schedule the request's draft tokens are scored
+    together (DeepGEMM next_n), so its index-K pages are read once per Q block rather
+    than once per token; every token's visible positions get the same bits (the
+    tokens of a request share its page row, and each token's length still bounds its
+    own top-k)."""
+    if metadata.verify_deep_gemm_metadata is not None:
+        n = metadata.verify_tokens
+        reqs = data.q_fp4.shape[0] // n
+        return deep_gemm_fp4_paged_mqa_logits(
+            (
+                data.q_fp4.view(reqs, n, *data.q_fp4.shape[2:]),
+                data.q_sf.view(reqs, n, data.q_sf.shape[-1]),
+            ),
+            data.k_cache,
+            data.weights,
+            metadata.verify_lens,
+            metadata.verify_page_table,
+            metadata.verify_deep_gemm_metadata,
+            metadata.max_compressed_seq_len,
+        )
+    return deep_gemm_fp4_paged_mqa_logits(
+        (data.q_fp4, data.q_sf),
+        data.k_cache,
+        data.weights,
+        metadata.compressed_seq_lens,
+        metadata.page_table,
+        metadata.deep_gemm_metadata,
+        metadata.max_compressed_seq_len,
+    )
 
 
 def get_deep_gemm_prefill_data(

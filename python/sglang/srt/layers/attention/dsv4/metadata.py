@@ -188,8 +188,20 @@ class PagedIndexerMetadata:
     # Rows per logits chunk for the prefill CUDA graph low-ratio indexer; 0 plans
     # all rows at once.
     row_chunk: int = 0
+    # Draft tokens per request of a uniform target-verify batch (rows are request-major,
+    # a request's rows share one page row); 0 for every other batch.
+    verify_tokens: int = 0
     # A list when the dynamic-budget forward is row-chunked: one schedule per chunk.
     deep_gemm_metadata: Any = field(init=False, repr=False)
+    # With verify_tokens > 1 on a single schedule: per-token lengths [requests,
+    # verify_tokens], one page row per request, and DeepGEMM's next_n schedule for them.
+    verify_lens: Optional[torch.Tensor] = field(init=False, repr=False, default=None)
+    verify_page_table: Optional[torch.Tensor] = field(
+        init=False, repr=False, default=None
+    )
+    verify_deep_gemm_metadata: Optional[torch.Tensor] = field(
+        init=False, repr=False, default=None
+    )
     topk_metadata: torch.Tensor = field(init=False, repr=False)
     nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
         init=False, repr=False, default=None
@@ -271,6 +283,21 @@ class PagedIndexerMetadata:
                     self.compressed_page_size,
                     deep_gemm.get_num_sms(),
                 )
+                n = self.verify_tokens
+                if n > 1 and not _IS_SM120 and num_rows % n == 0:
+                    reqs = num_rows // n
+                    self.verify_lens = compressed_seq_lens.reshape(reqs, n).contiguous()
+                    self.verify_page_table = self.page_table.reshape(reqs, n, -1)[
+                        :, 0
+                    ].contiguous()
+                    # DeepGEMM's own planner: it builds the next_n schedule the kernel walks.
+                    self.verify_deep_gemm_metadata = (
+                        deep_gemm.get_paged_mqa_logits_metadata(
+                            self.verify_lens,
+                            self.compressed_page_size,
+                            deep_gemm.get_num_sms(),
+                        )
+                    )
 
             assert isinstance(self.deep_gemm_metadata, (torch.Tensor, list))
 
@@ -360,7 +387,12 @@ class PagedIndexerMetadata:
         else:
             copy_fields = ["page_table", "compressed_seq_lens", "deep_gemm_metadata"]
             assign_fields = ["nonpaged_plan"]
-        copy_fields += ["topk_metadata"]
+        copy_fields += [
+            "topk_metadata",
+            "verify_lens",
+            "verify_page_table",
+            "verify_deep_gemm_metadata",
+        ]
         assign_fields += [
             "rows_per_chunk",
             "mqa_logits_budget_bytes",
@@ -374,6 +406,7 @@ class PagedIndexerMetadata:
                 "compressed_page_size",
                 "compress_ratio",
                 "row_chunk",
+                "verify_tokens",
                 "force_deep_gemm_metadata",
                 "use_prefill_cuda_graph",
                 "use_topk_v2",

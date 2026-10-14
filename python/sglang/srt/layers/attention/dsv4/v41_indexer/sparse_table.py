@@ -35,6 +35,7 @@ from sglang.srt.utils.common import async_h2d
 from .scoring import (
     DeepGEMMDecodeData,
     DeepGEMMPrefillData,
+    deep_gemm_decode_logits,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
     get_index_k_cache,
@@ -172,17 +173,10 @@ class SparseTableBackend:
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         metadata = inputs.paged_metadata
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
+        inputs.wait_index_k()
         if isinstance(metadata.deep_gemm_metadata, list):
             return self._publish_decode_chunked(inputs, data, seq_lens)
-        logits = deep_gemm_fp4_paged_mqa_logits(
-            (data.q_fp4, data.q_sf),
-            data.k_cache,
-            data.weights,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
-            metadata.deep_gemm_metadata,
-            metadata.max_compressed_seq_len,
-        )
+        logits = deep_gemm_decode_logits(data, metadata)
         main_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(main_stream)
         # The block-selection chain reads logits after the main stream moves on.
@@ -302,6 +296,7 @@ class SparseTableBackend:
     ) -> None:
         assert published is not None
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
+        inputs.wait_index_k()
         torch.cuda.current_stream().wait_event(published.ready)
         logits = sparse_logits(
             data.q_fp4,

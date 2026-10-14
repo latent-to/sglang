@@ -1323,6 +1323,7 @@ class DeepseekV4AttnBackend(
         *,
         compress_ratio: int = 4,
         use_prefill_cuda_graph: bool = False,
+        verify_tokens: int = 0,
     ):
         page_table = core_attn_metadata.page_table
         index_page_size = 0
@@ -1360,6 +1361,7 @@ class DeepseekV4AttnBackend(
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
+            verify_tokens=verify_tokens if index_page_size else 0,
         )
 
     def init_forward_metadata_decode(
@@ -2086,16 +2088,23 @@ class DeepseekV4AttnBackend(
         if c128_compress_metadata is None and self.has_c128:
             c128_compress_metadata = create(compress_ratio=128)
         low = core_attn_metadata.low_ratios
+        # Uniform verify rows are request-major with one page row per request, so the
+        # low-ratio indexer scores a request's draft tokens in one next_n pass.
+        verify_tokens = 0 if is_ragged else num_draft_tokens
         return DSV4Metadata(
             core_attn_metadata,
             indexer_metadata,
             c1_indexer_metadata=(
-                self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=1)
+                self.init_forward_metadata_indexer(
+                    core_attn_metadata, compress_ratio=1, verify_tokens=verify_tokens
+                )
                 if 1 in low
                 else None
             ),
             c2_indexer_metadata=(
-                self.init_forward_metadata_indexer(core_attn_metadata, compress_ratio=2)
+                self.init_forward_metadata_indexer(
+                    core_attn_metadata, compress_ratio=2, verify_tokens=verify_tokens
+                )
                 if 2 in low
                 else None
             ),
@@ -2979,8 +2988,12 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         run_compressor: bool = True,
         run_indexer: bool = True,
+        head_weights_raw: Optional[torch.Tensor] = None,
+        index_k_ready: Optional[torch.cuda.Event] = None,
     ) -> None:
-        """Runs on every ratio 1/2 layer before its attention."""
+        """Runs on every ratio 1/2 layer before its attention. ``head_weights_raw`` and
+        ``index_k_ready`` come from a caller that issued ``weights_proj(x)`` early and ran
+        the compressor on another stream (decode and verify only)."""
         if forward_batch.forward_mode.is_idle():
             return
         if forward_batch.encoder_swa_replay:
@@ -3008,7 +3021,20 @@ class DeepseekV4AttnBackend(
             # live rows only and falls through.
             req, pos = hoisted_req, hoisted_pos
         else:
-            req = token_req_indices(forward_batch, num_tokens=positions.shape[0])
+            # The decode/verify schedule (the caller that issued weights_proj early)
+            # skips the request rows: the DeepGEMM indexer reads none, only the
+            # compressor, the candidate publish and the torch indexer do.
+            skip_req = (
+                head_weights_raw is not None
+                and not (run_compressor and layer.compressor is not None)
+                and self.full_topk_indexer.use_deep_gemm_decode
+                and not layer.indexer.is_candidate_source
+            )
+            req = (
+                None
+                if skip_req
+                else token_req_indices(forward_batch, num_tokens=positions.shape[0])
+            )
             pos = positions
         if (
             forward_batch.forward_mode.is_extend()
@@ -3026,7 +3052,16 @@ class DeepseekV4AttnBackend(
         if run_compressor and layer.compressor is not None:
             self._low_ratio_compress(layer, x, req, pos, forward_batch)
         if run_indexer and layer.indexer is not None:
-            self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
+            self._low_ratio_index_topk(
+                layer,
+                x,
+                q_lora,
+                req,
+                pos,
+                forward_batch,
+                head_weights_raw=head_weights_raw,
+                index_k_ready=index_k_ready,
+            )
 
     def _forward_low_ratio_sources_cp(
         self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
@@ -3406,6 +3441,8 @@ class DeepseekV4AttnBackend(
         forward_batch,
         *,
         rows_per_request=None,  # NOTE: only used in CP
+        head_weights_raw=None,
+        index_k_ready=None,
     ) -> None:
         is_source = layer.indexer.is_candidate_source
         is_consumer = layer.indexer.uses_candidates
@@ -3424,7 +3461,7 @@ class DeepseekV4AttnBackend(
                 is_source = is_consumer = False
 
             inputs = self._make_low_ratio_decode_indexer_inputs(
-                layer, x, q_lora, req, pos, mode
+                layer, x, q_lora, req, pos, mode, head_weights_raw, index_k_ready
             )
             if is_source:
                 published = self.decode_candidates.publish_decode(inputs)
@@ -3472,7 +3509,9 @@ class DeepseekV4AttnBackend(
         )
         self.full_topk_indexer.topk_prefill_captured(inputs)
 
-    def _make_low_ratio_decode_indexer_inputs(self, layer, x, q_lora, req, pos, mode):
+    def _make_low_ratio_decode_indexer_inputs(
+        self, layer, x, q_lora, req, pos, mode, head_weights_raw=None, index_k_ready=None
+    ):
         ratio = layer.compress_ratio
         metadata = (
             self.forward_metadata.c1_indexer_metadata
@@ -3494,6 +3533,8 @@ class DeepseekV4AttnBackend(
             out_page_indices=self.forward_metadata.core_metadata.sparse_page_indices(
                 ratio
             ),
+            head_weights_raw=head_weights_raw,
+            index_k_ready=index_k_ready,
         )
 
     def _make_low_ratio_prefill_indexer_inputs(

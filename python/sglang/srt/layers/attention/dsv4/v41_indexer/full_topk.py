@@ -15,6 +15,7 @@ from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_m
 
 from .scoring import (
     decode_scores,
+    deep_gemm_decode_logits,
     dense_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
@@ -88,6 +89,7 @@ class FullTopKIndexer:
     def _deep_gemm_decode(self, inputs: DecodeInputs) -> None:
         data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
         metadata = inputs.paged_metadata
+        inputs.wait_index_k()
         if isinstance(metadata.deep_gemm_metadata, list):
             topk_plans = metadata.topk_metadata_chunks
             assert not metadata.use_topk_v2 or topk_plans is not None
@@ -112,21 +114,14 @@ class FullTopKIndexer:
                     ),
                 )
             return
-        logits = deep_gemm_fp4_paged_mqa_logits(
-            (data.q_fp4, data.q_sf),
-            data.k_cache,
-            data.weights,
-            metadata.compressed_seq_lens,
-            metadata.page_table,
-            metadata.deep_gemm_metadata,
-            metadata.max_compressed_seq_len,
-        )
+        logits = deep_gemm_decode_logits(data, metadata)
         # TODO(dark): add bf16 topk
         topk_transform_paged_from_metadata(
             logits, metadata, inputs.out_page_indices, None
         )
 
     def _torch_decode(self, inputs: DecodeInputs) -> None:
+        inputs.wait_index_k()
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,

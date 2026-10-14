@@ -78,12 +78,25 @@ class DecodeInputs(msgspec.Struct, frozen=True, kw_only=True):
     x: torch.Tensor  # [rows, hidden] bf16
     q_lora: torch.Tensor  # [rows, q_lora_rank]
     positions: torch.Tensor  # [rows] absolute position of each row
-    req_rows: torch.Tensor  # [rows] req_to_token row of each query row
+    # [rows] req_to_token row of each query row; None where no consumer reads it
+    # (the DeepGEMM decode paths other than the candidate publish).
+    req_rows: Optional[torch.Tensor]
     paged_metadata: PagedIndexerMetadata
     is_verify: bool
 
     # [rows, topk] int32 index-K pool slots of the selection, unordered, -1 padded.
     out_page_indices: torch.Tensor
+
+    # weights_proj(x) issued at the top of the layer (it reads x only), so it is off
+    # the q_lora -> top-k chain the attention waits for.
+    head_weights_raw: Optional[torch.Tensor] = None
+    # Recorded after this layer's compressor wrote the index K; the scoring waits on it
+    # when the compressor runs on its own stream, the query projection does not.
+    index_k_ready: Optional[torch.cuda.Event] = None
+
+    def wait_index_k(self) -> None:
+        if self.index_k_ready is not None:
+            torch.cuda.current_stream().wait_event(self.index_k_ready)
 
     def reset_outputs(self) -> None:
         self.out_page_indices.fill_(-1)

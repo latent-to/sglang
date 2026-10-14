@@ -1568,16 +1568,33 @@ class MQALayer(MqaAttentionBase):
         stream_kv = self.alt_streams[0]
         stream_sources = self.alt_streams[-1]
         x_linear = x_quant if x_quant is not None else x
+        from sglang.srt.model_executor.runner_utils.capture_mode import (
+            skip_low_ratio_indexer,
+        )
+
+        # Index layers: the compressor takes alt_streams[1] (idle in these layers) and
+        # weights_proj(x) is issued at once, so the index query chain starts on q_lora
+        # instead of queueing behind both; its scoring waits for the index K.
+        split = self.indexer is not None and not skip_low_ratio_indexer(
+            self.compress_ratio
+        )
+        stream_comp = self.alt_streams[1] if split else stream_sources
 
         # NOTE: wait for x ready
         if self.compressor is not None:
+            stream_comp.wait_stream(current_stream)
+        head_weights_raw: Optional[torch.Tensor] = None
+        if split:
             stream_sources.wait_stream(current_stream)
+            with torch.cuda.stream(stream_sources):
+                head_weights_raw = self.indexer.head_weights_raw(x)
         qkv_a: Optional[torch.Tensor] = None
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x_linear)
 
+        index_k_ready: Optional[torch.cuda.Event] = None
         if self.compressor is not None:
-            with torch.cuda.stream(stream_sources):
+            with torch.cuda.stream(stream_comp):
                 attn_backend.forward_low_ratio_sources(
                     layer=self,
                     x=x,
@@ -1586,6 +1603,8 @@ class MQALayer(MqaAttentionBase):
                     forward_batch=forward_batch,
                     run_indexer=False,
                 )
+                if split:
+                    index_k_ready = stream_comp.record_event()
 
         stream_kv.wait_stream(current_stream)
         q_lora, q_for_wqb = self._compute_q_a(x_linear, qkv_a=qkv_a)
@@ -1604,6 +1623,8 @@ class MQALayer(MqaAttentionBase):
                     positions=positions,
                     forward_batch=forward_batch,
                     run_compressor=False,
+                    head_weights_raw=head_weights_raw,
+                    index_k_ready=index_k_ready,
                 )
 
         with torch.cuda.stream(stream_kv):
@@ -1614,6 +1635,8 @@ class MQALayer(MqaAttentionBase):
         current_stream.wait_stream(stream_kv)
         if self.compressor is not None or self.indexer is not None:
             current_stream.wait_stream(stream_sources)
+        if split and self.compressor is not None:
+            current_stream.wait_stream(stream_comp)
         return q
 
     def _forward_prepare_multi_stream_npu(

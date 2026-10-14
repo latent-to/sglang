@@ -353,7 +353,11 @@ def create_state(
 
 def _launch_config(local_numel: int):
     assert local_numel % _NUMEL_PER_THREAD == 0
-    return _MIN_BLOCKS, _BLOCK_THREADS, _BLOCK_THREADS // 32, _NUMEL_PER_THREAD
+    # One grid-stride pass per block up to _MAX_BLOCKS: at 4 blocks a verify batch's
+    # vocab-logits gather moves ~150 GB/s (93 us at 108 rows on B300, TP2).
+    chunks = local_numel // _NUMEL_PER_THREAD
+    blocks = min(_MAX_BLOCKS, max(_MIN_BLOCKS, -(-chunks // _BLOCK_THREADS)))
+    return blocks, _BLOCK_THREADS, _BLOCK_THREADS // 32, _NUMEL_PER_THREAD
 
 
 def all_gather_inner(
