@@ -2790,3 +2790,10 @@ def hc_combine(
         BLOCK_H=block_h,
     )
     return y
+
+
+def __getattr__(name: str):
+    # Names removed after SGLang v0.5.21 that submitted arena bundles still use.
+    from sglang.srt.v0_5_21_compat import removed_attribute
+
+    return removed_attribute(__name__, name)

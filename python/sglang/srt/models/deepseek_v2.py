@@ -3505,3 +3505,10 @@ def dsv2_flashinfer_moe_dual_stream_graph(
 
 
 EntryClass = [DeepseekV2ForCausalLM, DeepseekV3ForCausalLM, DeepseekV32ForCausalLM]
+
+
+def __getattr__(name: str):
+    # Names removed after SGLang v0.5.21 that submitted arena bundles still use.
+    from sglang.srt.v0_5_21_compat import removed_attribute
+
+    return removed_attribute(__name__, name)

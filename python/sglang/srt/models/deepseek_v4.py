@@ -5748,3 +5748,10 @@ def _fuse_deepseek_v4_wqkv_a_pair(
             )
         return q
     return torch.cat([q, kv], dim=0)
+
+
+def __getattr__(name: str):
+    # Names removed after SGLang v0.5.21 that submitted arena bundles still use.
+    from sglang.srt.v0_5_21_compat import removed_attribute
+
+    return removed_attribute(__name__, name)

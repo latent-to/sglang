@@ -466,3 +466,10 @@ def prepare_cutedsl_fusion(
         max_m,
         len(fusions),
     )
+
+
+def __getattr__(name: str):
+    # Names removed after SGLang v0.5.21 that submitted arena bundles still use.
+    from sglang.srt.v0_5_21_compat import removed_attribute
+
+    return removed_attribute(__name__, name)

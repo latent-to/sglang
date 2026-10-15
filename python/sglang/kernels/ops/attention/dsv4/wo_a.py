@@ -50,3 +50,10 @@ def fused_rope_wo_a_bf16(
         y = x.new_empty((num_tokens, n_out))
         module.run(x, weight, freqs_cis, positions, None, None, y)
         return (y,)
+
+
+def __getattr__(name: str):
+    # Names removed after SGLang v0.5.21 that submitted arena bundles still use.
+    from sglang.srt.v0_5_21_compat import removed_attribute
+
+    return removed_attribute(__name__, name)
