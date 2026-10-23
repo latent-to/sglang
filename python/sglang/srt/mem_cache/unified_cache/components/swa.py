@@ -59,6 +59,20 @@ if TYPE_CHECKING:
     )
 
 
+
+def _decode_retransfers_swa_tail(allocator) -> bool:
+    """PD decode allocates a fresh SWA tail that prefill always transfers."""
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+    from sglang.srt.runtime_context import get_disagg
+
+    return (
+        get_disagg().disaggregation_mode == "decode"
+        and isinstance(allocator.get_kvcache(), (SWAKVPool, DeepSeekV4TokenToKVPool))
+        and allocator.page_size > 1
+        and hasattr(allocator, "alloc_extend_swa_tail")
+    )
+
 class SWAComponent(TreeComponent):
     """Sliding window attention component.
 
@@ -354,8 +368,12 @@ class SWAComponent(TreeComponent):
         state = {"len": float("inf")}
 
         # A per-request SWA ring is not stored in tree nodes, so its bookkeeping
-        # must not gate prefix matching.
-        swa_req_ring = is_swa_req_ring(self.cache.token_to_kv_pool_allocator)
+        # must not gate prefix matching. Neither may tree SWA on a PD decode that
+        # re-receives the whole SWA tail from prefill (upstream #45592).
+        allocator = self.cache.token_to_kv_pool_allocator
+        swa_req_ring = is_swa_req_ring(allocator) or _decode_retransfers_swa_tail(
+            allocator
+        )
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
