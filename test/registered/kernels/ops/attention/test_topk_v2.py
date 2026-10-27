@@ -379,22 +379,16 @@ def _narrow_seed(dist, *rest):
     return seed
 
 
-# Longest row that never reaches the CUDA cluster path, which still truncates an
-# overflowing threshold bin (the smallest get_static_cluster_floor in topk_v2.cuh).
-CUDA_MAX_NON_CLUSTER_SEQ = 24576
-
-
 @pytest.mark.parametrize("dist", NARROW_DISTRIBUTIONS)
 @pytest.mark.parametrize("batch,seq", [(6, 8192), (4, 20480), (4, 32768), (4, 65536)])
 @torch.inference_mode()
 def test_topk_v2_single_coarse_bin_is_exact(batch: int, seq: int, dist: str) -> None:
     """No tolerance here: the threshold bin holds the whole row at k=2048, so a
     dropped candidate is a wrong answer rather than a tie swap. Covers
-    register-path and streaming-path shapes, and a ROCm split-path shape (above
+    register-path and streaming-path shapes, the CUDA cluster path (rank 0
+    re-stages the cluster's overflow) and a ROCm split-path shape (above
     split_floor); tie staging is per-template.
     """
-    if not is_hip() and seq > CUDA_MAX_NON_CLUSTER_SEQ:
-        pytest.skip("CUDA may route this shape to the unrefined cluster path")
     torch.manual_seed(_narrow_seed(dist, batch, seq))
     device = "cuda"
     k = 2048

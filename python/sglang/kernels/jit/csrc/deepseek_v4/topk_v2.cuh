@@ -223,24 +223,121 @@ SGL_DEVICE void trivial_transform(const TopKProblem& problem, const PageTransfor
   });
 }
 
-template <TopKMode kMode>
-SGL_DEVICE void paged_transform(const TopKProblem& problem, int32_t* out, const PageTransform& transform) {
-  static_assert(kMode != TopKMode::INDICES, "paged_transform requires page-table output");
-  static_assert(kMaxTopK % kBlockSize == 0);
-  if constexpr (kMode == TopKMode::KPOOL) {
-    const auto staged = problem.out;
-    return kpool_expand(problem.seq_len, problem.topk, out, transform, [staged](uint32_t r) { return staged[r]; });
+/// Shared memory a kernel's top-k implementation has finished with, as words.
+struct Scratch {
+  uint32_t* words;
+  uint32_t num_words;
+};
+
+template <typename SmemT>
+SGL_DEVICE Scratch scratch_of(SmemT& smem) {
+  return {reinterpret_cast<uint32_t*>(&smem), static_cast<uint32_t>(sizeof(SmemT) / sizeof(uint32_t))};
+}
+
+/// Rewrites the first `count` (<= kMaxTopK) entries of the shared buffer `keys`,
+/// each -1 or distinct in [0, bound), ascending with -1 last. The selection
+/// otherwise lands in the order threads win their atomics, and sparse attention
+/// accumulates over it in that order, so an unsorted row is not a function of
+/// the scores. With room for a `bound`-bit set in `scratch` the entries are
+/// ranked by a popcount prefix over it; longer rows take a bitonic sort. Block-
+/// wide: `keys` must be published by a barrier first, and the sort ends with one.
+SGL_DEVICE void sort_selection(int32_t* keys, const uint32_t count, const uint32_t bound, const Scratch scratch) {
+  static_assert(kMaxTopK == 2 * kBlockSize, "one compare-exchange per thread per step");
+  static_assert(kBlockSize == device::kWarpSize * device::kWarpSize, "one warp scans the warp totals");
+  const auto tx = threadIdx.x;
+  const uint32_t num_words = (bound + 31) / 32;
+  if (num_words <= scratch.num_words) {
+    __shared__ uint32_t s_warp_total[kBlockSize / device::kWarpSize];
+    const auto bitset = scratch.words;
+    for (uint32_t w = tx; w < num_words; w += kBlockSize) {
+      bitset[w] = 0;
+    }
+    __syncthreads();
+    for_each_item(count, [&](uint32_t t, uint32_t) {
+      if (const auto v = static_cast<uint32_t>(keys[t]); v < bound) atomicOr(&bitset[v / 32], 1u << (v % 32));
+    });
+    __syncthreads();
+    // Each thread ranks a contiguous run of words, so thread order is value order.
+    const uint32_t per = (num_words + kBlockSize - 1) / kBlockSize;
+    const uint32_t first = min(tx * per, num_words);
+    const uint32_t last = min(first + per, num_words);
+    uint32_t mine = 0;
+    for (uint32_t w = first; w < last; ++w) {
+      mine += __popc(bitset[w]);
+    }
+    const auto lane_id = tx % device::kWarpSize;
+    const auto warp_id = tx / device::kWarpSize;
+    const auto inc = device::warp::inclusive_sum(mine, lane_id);
+    if (lane_id == device::kWarpSize - 1) s_warp_total[warp_id] = inc;
+    __syncthreads();
+    const auto warp_total = s_warp_total[lane_id];
+    uint32_t pos = device::warp::reduce_sum(lane_id < warp_id ? warp_total : 0u) + inc - mine;
+    const uint32_t total = device::warp::reduce_sum(warp_total);
+    for (uint32_t w = first; w < last; ++w) {
+      for (uint32_t bits = bitset[w]; bits != 0; bits &= bits - 1) {
+        keys[pos++] = static_cast<int32_t>(w * 32 + __ffs(bits) - 1);
+      }
+    }
+    for (uint32_t t = total + tx; t < count; t += kBlockSize) {
+      keys[t] = -1;
+    }
+    __syncthreads();
+    return;
   }
-  constexpr uint32_t kNumElems = kMaxTopK / kBlockSize;
-  int32_t indices[kNumElems];
-  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) {
-    // load into register at once
-    indices[i] = problem.out[tx];
-  });
-  for_each_item(problem.topk, [&](uint32_t tx, uint32_t i) {
-    // safe write to output
-    out[tx] = indices[i] >= 0 ? transform.page_to_indices(indices[i]) : -1;
-    if constexpr (kMode == TopKMode::DUAL_OUTPUT) transform.raw_out[tx] = indices[i];
+  const auto data = reinterpret_cast<uint32_t*>(keys);
+  const uint32_t n = count <= 1 ? 1 : 1u << (32 - __clz(count - 1));
+  for (uint32_t t = count + tx; t < n; t += kBlockSize) {
+    data[t] = 0xFFFFFFFFu;
+  }
+  __syncthreads();
+#pragma unroll 1
+  for (uint32_t size = 2; size <= n; size <<= 1) {
+#pragma unroll 1
+    for (uint32_t stride = size / 2; stride > 0; stride /= 2) {
+      if (tx < n / 2) {
+        const uint32_t i = 2 * tx - (tx & (stride - 1));
+        const uint32_t a = data[i];
+        const uint32_t b = data[i + stride];
+        if ((a > b) == ((i & size) == 0)) {
+          data[i] = b;
+          data[i + stride] = a;
+        }
+      }
+#ifndef USE_ROCM
+      const uint32_t next = stride > 1 ? stride / 2 : size;  // the following step's stride
+      if (stride <= device::kWarpSize && next <= device::kWarpSize && !(stride == 1 && size == n)) {
+        __syncwarp();
+        continue;
+      }
+#endif
+      __syncthreads();
+    }
+  }
+}
+
+/// Writes the row's selection through the page table, sorted (sort_selection)
+/// in the shared buffer `stage`. The selection is in `problem.out`: `stage`
+/// itself, published by the caller's barrier, or the output row of the cluster
+/// epilogue, which is copied in before anything is written back. `scratch` must
+/// not overlap `stage`. KPOOL (GLM's k-pool indexer, not DeepSeek-V4.1) expands
+/// the staged pools in the order they were selected, as upstream does.
+template <TopKMode kMode>
+SGL_DEVICE void paged_transform(
+    const TopKProblem& problem, int32_t* stage, int32_t* out, const PageTransform& transform, const Scratch scratch) {
+  static_assert(kMode != TopKMode::INDICES, "paged_transform requires page-table output");
+  if (problem.out != stage) {
+    for_each_item(problem.topk, [&](uint32_t tx, uint32_t) { stage[tx] = problem.out[tx]; });
+  }
+  if constexpr (kMode == TopKMode::KPOOL) {
+    // the expansion reads other threads' slots
+    __syncthreads();
+    return kpool_expand(problem.seq_len, problem.topk, out, transform, [stage](uint32_t r) { return stage[r]; });
+  }
+  sort_selection(stage, problem.topk, problem.seq_len, scratch);
+  for_each_item(problem.topk, [&](uint32_t tx, uint32_t) {
+    const auto idx = stage[tx];
+    out[tx] = idx >= 0 ? transform.page_to_indices(idx) : -1;
+    if constexpr (kMode == TopKMode::DUAL_OUTPUT) transform.raw_out[tx] = idx;
   });
 }
 
@@ -303,15 +400,16 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
     }
   }
   using device::topk::broadcast;
+  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
+  __shared__ int32_t s_topk_indices[kMaxTopK];
   const auto problem = TopKProblem{
       .in = score + (row_start - rem),
-      .out = out,
+      .out = s_topk_indices,  // window positions, written sorted plus the offset
       .topk = topk,
       .seq_len = seq_len + rem,
-      .bias = broadcast(offset - static_cast<int32_t>(rem)),
+      .bias = broadcast(-static_cast<int32_t>(rem)),
       .input_start = broadcast(rem),
   };
-  __shared__ impl::MaxSmem<Register2::Smem, Register4::Smem, Streaming::Smem> smem;
   if (problem.seq_len <= Register2::kMaxSeqLen) {
     Register2::forward<kPDL>(problem, &smem);
   } else if (problem.seq_len <= Register4::kMaxSeqLen) {
@@ -320,6 +418,12 @@ TOPK_KERNEL void topk_ragged_kernel(const __grid_constant__ TopKRaggedParams par
     Streaming::forward<kPDL>(problem, &smem);
   }
   // PDL trigger secondary at the end the block typically has no use, so ignore it
+  __syncthreads();
+  sort_selection(s_topk_indices, topk, seq_len, scratch_of(smem));
+  for_each_item(topk, [&](uint32_t tx, uint32_t) {
+    const auto pos = s_topk_indices[tx];
+    out[tx] = pos >= 0 ? pos + offset : -1;
+  });
 }
 
 struct TopKRaggedKpoolParams {
@@ -405,7 +509,7 @@ SGL_DEVICE void ragged_select_transform(
   device::PDLTriggerSecondary<kPDL>();
   __syncthreads();
   problem.seq_len = seq_len;
-  paged_transform<kMode>(problem, out, transform);
+  paged_transform<kMode>(problem, s_topk_indices, out, transform, scratch_of(*smem));
 }
 
 template <bool kPDL>
@@ -536,14 +640,9 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
         device::PDLWaitPrimary<kPDLFinal>();
         problem.out = params.get_output_ptr(bx);  // in-place transform
         device::PDLTriggerSecondary<kPDL>();
-        if constexpr (kMode == TopKMode::KPOOL) {
-          for_each_item(problem.topk, [&](uint32_t tx, uint32_t) { s_topk_indices[tx] = problem.out[tx]; });
-          __syncthreads();
-          const auto out = problem.out;
-          problem.out = s_topk_indices;
-          return paged_transform<kMode>(problem, out, params.template get_transform<kMode>(bx));
-        }
-        return paged_transform<kMode>(problem, problem.out, params.template get_transform<kMode>(bx));
+        // paged_transform copies the row into s_topk_indices before writing any of it back
+        return paged_transform<kMode>(
+            problem, s_topk_indices, problem.out, params.template get_transform<kMode>(bx), scratch_of(smem));
       } else {
         return device::PDLTriggerSecondary<kPDL>();
       }
@@ -553,7 +652,8 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKPagedParams params
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kNeedStaging) {
     __syncthreads();
-    paged_transform<kMode>(problem, params.get_output_ptr(bx), params.template get_transform<kMode>(bx));
+    paged_transform<kMode>(
+        problem, s_topk_indices, params.get_output_ptr(bx), params.template get_transform<kMode>(bx), scratch_of(smem));
   }
 }
 
@@ -638,7 +738,12 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
       cluster.sync();
       if (by != 0) return;
       problem.out = s_topk_indices;
-      return paged_transform<kMode>(problem, params.get_output_ptr(bx), params.template get_transform<kMode>(bx));
+      return paged_transform<kMode>(
+          problem,
+          s_topk_indices,
+          params.get_output_ptr(bx),
+          params.template get_transform<kMode>(bx),
+          scratch_of(smem));
     } else {
       return device::PDLTriggerSecondary<kPDL>();
     }
@@ -647,7 +752,8 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
   device::PDLTriggerSecondary<kPDL>();
   if constexpr (kNeedStaging) {
     __syncthreads();
-    paged_transform<kMode>(problem, params.get_output_ptr(bx), params.template get_transform<kMode>(bx));
+    paged_transform<kMode>(
+        problem, s_topk_indices, params.get_output_ptr(bx), params.template get_transform<kMode>(bx), scratch_of(smem));
   }
 }
 
@@ -1006,7 +1112,12 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
     }
     if constexpr (kNeedStaging) {
       __syncthreads();
-      paged_transform<kMode>(problem, params.get_output_ptr(row), params.template get_transform<kMode>(row));
+      paged_transform<kMode>(
+          problem,
+          s_topk_indices,
+          params.get_output_ptr(row),
+          params.template get_transform<kMode>(row),
+          scratch_of(smem));
     }
     return;
   }
@@ -1023,10 +1134,13 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
   TopKSplit::clear_row(row_hist);
   TopKSplit::finish_ties(problem, ties, split_smem);
   if constexpr (kNeedStaging) {
-    // problem.out is already the destination, and paged_transform reads every
-    // slot into registers before writing any, so transforming in place is safe.
+    // problem.out is already the destination; paged_transform copies every slot
+    // into `staged`, dead once finish_ties has emitted, before writing any.
     __syncthreads();
-    paged_transform<kMode>(problem, problem.out, params.template get_transform<kMode>(row));
+    // The base Smem ends before `staged`, so it is the scratch.
+    auto& base_smem = *static_cast<TopKSplit::Base::Smem*>(split_smem);
+    paged_transform<kMode>(
+        problem, split_smem->staged, problem.out, params.template get_transform<kMode>(row), scratch_of(base_smem));
   }
 }
 
